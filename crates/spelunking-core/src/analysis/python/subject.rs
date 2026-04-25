@@ -105,8 +105,20 @@ pub struct DjangoSubjectEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DjangoSubjectCandidate {
+    pub subject: String,
+    pub model: String,
+    pub path: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DjangoSubjectError {
     InvalidSubject(String),
+    AmbiguousSubject {
+        subject: String,
+        candidates: Vec<DjangoSubjectCandidate>,
+    },
 }
 
 impl fmt::Display for DjangoSubjectError {
@@ -114,8 +126,28 @@ impl fmt::Display for DjangoSubjectError {
         match self {
             Self::InvalidSubject(subject) => write!(
                 f,
-                "invalid subject '{subject}'. Expected a Django subject like Model.field"
+                "invalid subject '{subject}'. Expected a Django subject like Model.field or app.Model.field"
             ),
+            Self::AmbiguousSubject {
+                subject,
+                candidates,
+            } => {
+                let suggestions = candidates
+                    .iter()
+                    .map(|candidate| {
+                        format!(
+                            "{} ({}:{})",
+                            candidate.subject, candidate.path, candidate.line
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                write!(
+                    f,
+                    "ambiguous subject '{subject}'. Found multiple plausible models; use one of: {suggestions}"
+                )
+            }
         }
     }
 }
@@ -174,7 +206,8 @@ pub fn inspect_django_subject(
     let root = root.as_ref();
     let parts = SubjectParts::parse(subject)?;
     let classes = discover_classes(root, modules);
-    let candidate = find_model_candidate(&classes, &parts);
+    let candidates = find_model_candidates(&classes, &parts);
+    let candidate = resolve_model_candidate(&parts, candidates)?;
 
     let Some(candidate) = candidate else {
         return Ok(DjangoSubjectReport {
@@ -293,13 +326,19 @@ fn collect_classes<'a>(
     }
 }
 
-fn find_model_candidate<'a>(
+fn find_model_candidates<'a>(
     classes: &'a [DiscoveredClass<'a>],
     parts: &SubjectParts,
-) -> Option<ModelCandidate<'a>> {
-    classes
+) -> Vec<ModelCandidate<'a>> {
+    let mut candidates = classes
         .iter()
         .filter(|class| class_name(&class.qualified_name) == parts.model_name)
+        .filter(|class| {
+            parts
+                .app_hint
+                .as_ref()
+                .is_none_or(|app_hint| class_matches_app_hint(class, app_hint))
+        })
         .map(|class| {
             let mut score = 1;
 
@@ -335,7 +374,39 @@ fn find_model_candidate<'a>(
                 confidence,
             }
         })
-        .max_by_key(|candidate| candidate.score)
+        .filter(|candidate| candidate.score >= 50)
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then(left.class.module_path.cmp(&right.class.module_path))
+            .then(left.class.qualified_name.cmp(&right.class.qualified_name))
+    });
+    candidates
+}
+
+fn resolve_model_candidate<'a>(
+    parts: &SubjectParts,
+    candidates: Vec<ModelCandidate<'a>>,
+) -> Result<Option<ModelCandidate<'a>>, DjangoSubjectError> {
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.into_iter().next()),
+        _ => Err(DjangoSubjectError::AmbiguousSubject {
+            subject: parts.raw.clone(),
+            candidates: candidates
+                .iter()
+                .map(|candidate| DjangoSubjectCandidate {
+                    subject: candidate_subject(&candidate.class, &parts.field_name),
+                    model: candidate.class.qualified_name.clone(),
+                    path: candidate.class.module_path.clone(),
+                    line: line_for_node(candidate.class.module, candidate.class.class_def),
+                })
+                .collect(),
+        }),
+    }
 }
 
 fn build_report(
@@ -1230,11 +1301,52 @@ fn is_django_model_like(class: &DiscoveredClass<'_>) -> bool {
 
 fn class_matches_app_hint(class: &DiscoveredClass<'_>, app_hint: &str) -> bool {
     let path_hint = app_hint.replace('.', "/");
+    let app_hint_label = class_name(app_hint);
 
     class.python_module == app_hint
         || class.python_module.starts_with(&format!("{app_hint}."))
         || class.module_path == path_hint
         || class.module_path.starts_with(&format!("{path_hint}/"))
+        || app_label(class).as_deref() == Some(app_hint_label)
+}
+
+fn candidate_subject(class: &DiscoveredClass<'_>, field_name: &str) -> String {
+    format!(
+        "{}.{}.{}",
+        app_label(class).unwrap_or_else(|| class.python_module.clone()),
+        class_name(&class.qualified_name),
+        field_name
+    )
+}
+
+fn app_label(class: &DiscoveredClass<'_>) -> Option<String> {
+    app_label_from_module_path(&class.module_path)
+}
+
+fn app_label_from_module_path(module_path: &str) -> Option<String> {
+    let parts = module_path.split('/').collect::<Vec<_>>();
+
+    if let Some(apps_index) = parts.iter().position(|part| *part == "apps")
+        && let Some(label) = parts.get(apps_index + 1)
+        && !label.is_empty()
+    {
+        return Some((*label).to_owned());
+    }
+
+    if let Some(models_index) = parts
+        .iter()
+        .position(|part| *part == "models.py" || *part == "models")
+        && models_index > 0
+        && let Some(label) = parts.get(models_index - 1)
+        && !label.is_empty()
+    {
+        return Some((*label).to_owned());
+    }
+
+    parts
+        .first()
+        .filter(|part| !part.is_empty())
+        .map(|part| (*part).to_owned())
 }
 
 fn meta_model_reference(suite: &ast::Suite, import_index: &ImportIndex) -> Option<String> {
@@ -1927,6 +2039,85 @@ urlpatterns = [
                 .related_components
                 .iter()
                 .any(|component| component.name == "ReservationViewSet")
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_short_model_subjects() {
+        let project = TempProject::new("ambiguous-subject");
+        let web_ticket = project.write(
+            "dynamic_pricing/apps/web/models/ticket.py",
+            r#"
+from django.db import models
+
+class Ticket(models.Model):
+    status = models.CharField(max_length=20)
+"#,
+        );
+        let billing_ticket = project.write(
+            "dynamic_pricing/apps/billing/models/ticket.py",
+            r#"
+from django.db import models
+
+class Ticket(models.Model):
+    status = models.CharField(max_length=20)
+"#,
+        );
+        let report = parse_python_files(&[web_ticket, billing_ticket]);
+        let error = inspect_django_subject(&project.path, &report.modules, "Ticket.status")
+            .expect_err("short subject should be ambiguous");
+
+        match error {
+            DjangoSubjectError::AmbiguousSubject {
+                subject,
+                candidates,
+            } => {
+                assert_eq!(subject, "Ticket.status");
+                assert_eq!(candidates.len(), 2);
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|candidate| candidate.subject == "web.Ticket.status")
+                );
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|candidate| candidate.subject == "billing.Ticket.status")
+                );
+            }
+            DjangoSubjectError::InvalidSubject(_) => panic!("expected ambiguous subject error"),
+        }
+    }
+
+    #[test]
+    fn resolves_app_qualified_subjects() {
+        let project = TempProject::new("qualified-subject");
+        let web_ticket = project.write(
+            "dynamic_pricing/apps/web/models/ticket.py",
+            r#"
+from django.db import models
+
+class Ticket(models.Model):
+    status = models.CharField(max_length=20)
+"#,
+        );
+        let billing_ticket = project.write(
+            "dynamic_pricing/apps/billing/models/ticket.py",
+            r#"
+from django.db import models
+
+class Ticket(models.Model):
+    status = models.CharField(max_length=20)
+"#,
+        );
+        let report = parse_python_files(&[web_ticket, billing_ticket]);
+        let subject =
+            inspect_django_subject(&project.path, &report.modules, "billing.Ticket.status")
+                .expect("app-qualified subject should resolve");
+
+        assert_eq!(
+            subject.model.as_ref().map(|model| model.path.as_str()),
+            Some("dynamic_pricing/apps/billing/models/ticket.py")
         );
     }
 }

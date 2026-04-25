@@ -19,16 +19,18 @@ cargo run -p spelunking-cli -- /path/to/django-project
 
 Use `--list-files` to print every discovered Python file. Use `--fail-on-diagnostics` to return a non-zero exit code when any file cannot be read or parsed.
 
-Inspect a specific Django model field to produce a structural radiography with model location, candidate lifecycle field, detected states, fields, related models, relevant methods, related serializers/views, evidence, and confidence:
+Inspect a specific Django model field to produce a structural radiography with model location, candidate lifecycle field, detected states, fields, related models, relevant methods, related serializers/views, evidence, and confidence. Use the Django app label when a short model name may be ambiguous:
 
 ```sh
-cargo run -p spelunking-cli -- /path/to/django-project --inspect-subject Reservation.status
+cargo run -p spelunking-cli -- /path/to/django-project --inspect-subject reservations.Reservation.status
 ```
+
+Short subjects such as `Reservation.status` are accepted only when exactly one plausible Django model named `Reservation` exists. If multiple apps define the same model name, Spelunking rejects the request and suggests app-qualified subjects like `web.Ticket.status`.
 
 Use JSON when another tool or agent should consume the result:
 
 ```sh
-cargo run -p spelunking-cli -- /path/to/django-project --inspect-subject Reservation.status --format json
+cargo run -p spelunking-cli -- /path/to/django-project --inspect-subject reservations.Reservation.status --format json
 ```
 
 The CLI can also emit the current graph contract as versioned JSON. The export includes summary counts, filters, parse/read diagnostics, and the graph itself. The graph contains source-file, Django app, model, URL, view, serializer, form, service, middleware, context processor, signal, signal handler, and task nodes, plus containment, call, inheritance, direct ORM relationship, URL routing, serialization, query, global hook intercept, and trigger edges:
