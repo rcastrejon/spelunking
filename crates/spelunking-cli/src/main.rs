@@ -98,6 +98,10 @@ fn print_summary(
     );
     println!("Django forms: {}", graph.node_count_by_type(NodeType::Form));
     println!(
+        "Django middleware: {}",
+        graph.node_count_by_type(NodeType::Middleware)
+    );
+    println!(
         "Model inheritance edges: {}",
         graph.edge_count_by_type(EdgeType::Inherits)
     );
@@ -116,6 +120,10 @@ fn print_summary(
     println!(
         "Query edges: {}",
         graph.edge_count_by_type(EdgeType::Queries)
+    );
+    println!(
+        "Middleware intercept edges: {}",
+        graph.edge_count_by_type(EdgeType::Intercepts)
     );
 
     if cli.list_files {

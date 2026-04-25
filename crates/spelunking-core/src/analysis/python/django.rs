@@ -25,6 +25,7 @@ impl Analyzer for DjangoModelAnalyzer {
 
     fn analyze(&self, context: &AnalysisContext<'_>, graph: &mut GraphBuilder) {
         let mut index = DjangoProjectIndex::from_context(context);
+        index.resolve_runtime_context();
         index.resolve_model_classes();
         index.resolve_data_layers();
         index.resolve_routes();
@@ -102,6 +103,41 @@ impl DjangoApp {
     fn node_key(&self) -> NodeKey {
         NodeKey::new(NodeType::App, self.identifier.clone())
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct DjangoSettingsModule {
+    source_file: Option<NodeIndex>,
+    installed_apps: Vec<String>,
+    middleware: Vec<String>,
+    root_urlconf: Option<String>,
+}
+
+impl DjangoSettingsModule {
+    fn has_runtime_context(&self) -> bool {
+        !self.installed_apps.is_empty()
+            || !self.middleware.is_empty()
+            || self.root_urlconf.is_some()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AppConfigDefinition {
+    name: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ConfiguredApp {
+    source_file: Option<NodeIndex>,
+    app: DjangoApp,
+}
+
+#[derive(Debug, Clone)]
+struct ConfiguredMiddleware {
+    source_file: Option<NodeIndex>,
+    value: String,
+    ordinal: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +247,10 @@ struct DjangoProjectIndex {
     raw_routes_by_python_module: HashMap<String, Vec<usize>>,
     router_registrations_by_owner: HashMap<(String, String), Vec<RouterRegistration>>,
     routes: Vec<ResolvedRoutePattern>,
+    settings_modules: Vec<DjangoSettingsModule>,
+    app_configs_by_python_name: HashMap<String, AppConfigDefinition>,
+    configured_apps: Vec<ConfiguredApp>,
+    middleware: Vec<ConfiguredMiddleware>,
 }
 
 impl DjangoProjectIndex {
@@ -240,6 +280,7 @@ impl DjangoProjectIndex {
                 &import_index,
                 &module.ast,
             );
+            collect_settings_in_suite(&mut index, source_file, &import_index, &module.ast);
         }
 
         index
@@ -273,6 +314,11 @@ impl DjangoProjectIndex {
         }
 
         self.classes.push(class);
+    }
+
+    fn add_app_config(&mut self, python_qualified_name: String, app_config: AppConfigDefinition) {
+        self.app_configs_by_python_name
+            .insert(python_qualified_name, app_config);
     }
 
     fn add_view(&mut self, view: ViewSymbol) {
@@ -317,6 +363,111 @@ impl DjangoProjectIndex {
             .entry((python_module.to_owned(), variable.to_owned()))
             .or_default()
             .push(registration);
+    }
+
+    fn add_settings_module(&mut self, settings: DjangoSettingsModule) {
+        if settings.has_runtime_context() {
+            self.settings_modules.push(settings);
+        }
+    }
+
+    fn resolve_runtime_context(&mut self) {
+        self.configured_apps.clear();
+        self.middleware.clear();
+
+        let mut middleware_ordinal = 0;
+
+        for settings in self.settings_modules.clone() {
+            for installed_app in settings.installed_apps {
+                let app = self.django_app_from_installed_app(&installed_app);
+
+                self.configured_apps.push(ConfiguredApp {
+                    source_file: settings.source_file,
+                    app,
+                });
+            }
+
+            for middleware in settings.middleware {
+                self.middleware.push(ConfiguredMiddleware {
+                    source_file: settings.source_file,
+                    value: middleware,
+                    ordinal: middleware_ordinal,
+                });
+                middleware_ordinal += 1;
+            }
+        }
+
+        self.apply_configured_apps_to_classes();
+        self.rebuild_class_app_index();
+    }
+
+    fn django_app_from_installed_app(&self, value: &str) -> DjangoApp {
+        if let Some(app_config) = self.app_configs_by_python_name.get(value) {
+            let identifier = app_config
+                .name
+                .clone()
+                .unwrap_or_else(|| app_module_from_installed_app(value));
+            let label = app_config
+                .label
+                .clone()
+                .unwrap_or_else(|| last_dotted_segment(&identifier).to_owned());
+            let path = identifier.replace('.', "/");
+
+            return DjangoApp {
+                identifier,
+                label,
+                path,
+            };
+        }
+
+        let identifier = app_module_from_installed_app(value);
+        let label = last_dotted_segment(&identifier).to_owned();
+        let path = identifier.replace('.', "/");
+
+        DjangoApp {
+            identifier,
+            label,
+            path,
+        }
+    }
+
+    fn apply_configured_apps_to_classes(&mut self) {
+        let configured_apps = self
+            .configured_apps
+            .iter()
+            .map(|configured| configured.app.clone())
+            .collect::<Vec<_>>();
+
+        for class in &mut self.classes {
+            if let Some(app) = app_for_python_module(&configured_apps, &class.python_module) {
+                class.app = Some(app);
+            }
+        }
+    }
+
+    fn rebuild_class_app_index(&mut self) {
+        let mut class_app_entries = Vec::new();
+
+        for (class_index, class) in self.classes.iter().enumerate() {
+            let class_name = class_name(&class.qualified_name).to_owned();
+
+            if let Some(app) = &class.app {
+                class_app_entries.push((app.label.clone(), class_name.clone(), class_index));
+            }
+
+            if let Some(inferred_app) = infer_django_app(&class.module_path)
+                && class.app.as_ref() != Some(&inferred_app)
+            {
+                class_app_entries.push((inferred_app.label, class_name.clone(), class_index));
+            }
+        }
+
+        self.classes_by_app_and_name.clear();
+
+        for (app_label, class_name, class_index) in class_app_entries {
+            self.classes_by_app_and_name
+                .insert((app_label, class_name), class_index);
+        }
     }
 
     fn resolve_model_classes(&mut self) {
@@ -387,6 +538,48 @@ impl DjangoProjectIndex {
     fn resolve_routes(&mut self) {
         self.routes.clear();
 
+        let root_route_indices =
+            if let Some(root_route_indices) = self.configured_root_route_indices() {
+                root_route_indices
+            } else {
+                self.inferred_root_route_indices()
+            };
+
+        let mut routes = Vec::new();
+
+        for route_index in root_route_indices {
+            self.expand_route(route_index, "", &mut Vec::new(), &mut routes);
+        }
+
+        self.routes = routes;
+    }
+
+    fn configured_root_route_indices(&self) -> Option<Vec<usize>> {
+        let root_urlconfs = self
+            .settings_modules
+            .iter()
+            .filter_map(|settings| settings.root_urlconf.as_ref())
+            .collect::<HashSet<_>>();
+
+        if root_urlconfs.is_empty() {
+            return None;
+        }
+
+        let route_indices = self
+            .raw_routes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, route)| {
+                root_urlconfs
+                    .contains(&route.python_module)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        (!route_indices.is_empty()).then_some(route_indices)
+    }
+
+    fn inferred_root_route_indices(&self) -> Vec<usize> {
         let included_modules = self
             .raw_routes
             .iter()
@@ -396,22 +589,13 @@ impl DjangoProjectIndex {
             })
             .collect::<HashSet<_>>();
 
-        let root_route_indices = self
-            .raw_routes
+        self.raw_routes
             .iter()
             .enumerate()
             .filter_map(|(index, route)| {
                 (!included_modules.contains(&route.python_module)).then_some(index)
             })
-            .collect::<Vec<_>>();
-
-        let mut routes = Vec::new();
-
-        for route_index in root_route_indices {
-            self.expand_route(route_index, "", &mut Vec::new(), &mut routes);
-        }
-
-        self.routes = routes;
+            .collect()
     }
 
     fn expand_route(
@@ -480,6 +664,8 @@ impl DjangoProjectIndex {
 
         model_class_indices.sort_unstable();
 
+        self.emit_configured_app_graph(graph, &mut app_nodes);
+
         for &class_index in &model_class_indices {
             let class = &self.classes[class_index];
             let model = graph.add_node(
@@ -526,8 +712,9 @@ impl DjangoProjectIndex {
         }
 
         let data_layer_nodes = self.emit_data_layer_graph(graph, &model_nodes);
+        let middleware_nodes = self.emit_middleware_graph(graph);
 
-        self.emit_route_graph(graph, &data_layer_nodes, &model_nodes);
+        self.emit_route_graph(graph, &data_layer_nodes, &model_nodes, &middleware_nodes);
     }
 
     fn resolve_model_reference(
@@ -641,11 +828,81 @@ impl DjangoProjectIndex {
         data_layer_nodes
     }
 
+    fn emit_configured_app_graph(
+        &self,
+        graph: &mut GraphBuilder,
+        app_nodes: &mut HashMap<String, NodeIndex>,
+    ) {
+        let mut configured_apps = self.configured_apps.iter().collect::<Vec<_>>();
+
+        configured_apps.sort_by(|left, right| left.app.identifier.cmp(&right.app.identifier));
+
+        for configured_app in configured_apps {
+            let node = *app_nodes
+                .entry(configured_app.app.identifier.clone())
+                .or_insert_with(|| {
+                    graph.add_node(
+                        configured_app.app.node_key(),
+                        configured_app.app.label.clone(),
+                        Some(configured_app.app.path.clone()),
+                    )
+                });
+
+            if let Some(source_file) = configured_app.source_file {
+                graph.add_edge(source_file, node, EdgeType::Contains);
+            }
+        }
+    }
+
+    fn emit_middleware_graph(&self, graph: &mut GraphBuilder) -> Vec<NodeIndex> {
+        let mut middleware = self.middleware.iter().collect::<Vec<_>>();
+        let mut middleware_nodes = Vec::new();
+        let mut emitted = HashSet::new();
+
+        middleware.sort_by_key(|middleware| middleware.ordinal);
+
+        for reference in middleware {
+            let (identifier, label, path, source_file) =
+                if let Some(class_index) = self.classes_by_python_name.get(&reference.value) {
+                    let class = &self.classes[*class_index];
+
+                    (
+                        class.python_qualified_name.clone(),
+                        class.qualified_name.clone(),
+                        Some(class.module_path.clone()),
+                        class.source_file,
+                    )
+                } else {
+                    (
+                        reference.value.clone(),
+                        class_name(&reference.value).to_owned(),
+                        None,
+                        reference.source_file,
+                    )
+                };
+
+            if !emitted.insert(identifier.clone()) {
+                continue;
+            }
+
+            let node = graph.add_node(NodeKey::new(NodeType::Middleware, identifier), label, path);
+
+            if let Some(source_file) = source_file {
+                graph.add_edge(source_file, node, EdgeType::Contains);
+            }
+
+            middleware_nodes.push(node);
+        }
+
+        middleware_nodes
+    }
+
     fn emit_route_graph(
         &self,
         graph: &mut GraphBuilder,
         data_layer_nodes: &HashMap<usize, NodeIndex>,
         model_nodes: &HashMap<usize, NodeIndex>,
+        middleware_nodes: &[NodeIndex],
     ) {
         let mut view_nodes = HashMap::new();
 
@@ -661,6 +918,10 @@ impl DjangoProjectIndex {
 
             if let Some(source_file) = route.source_file {
                 graph.add_edge(source_file, url, EdgeType::Contains);
+            }
+
+            for &middleware in middleware_nodes {
+                graph.add_edge(middleware, url, EdgeType::Intercepts);
             }
 
             let view = self.view_node_for_reference(graph, &route.view, &mut view_nodes);
@@ -845,7 +1106,7 @@ fn collect_class(
 
     let qualified_name = class_stack.join(".");
     let python_qualified_name = format!("{python_module}.{qualified_name}");
-    let bases = class_def
+    let bases: Vec<ModelReference> = class_def
         .bases
         .iter()
         .filter_map(|base| expr_model_reference(base, import_index))
@@ -853,6 +1114,7 @@ fn collect_class(
     let relationships = collect_relationships(&class_def.body, import_index);
     let data_model = collect_meta_model_reference(&class_def.body, import_index);
     let references = collect_symbol_references(&class_def.body, import_index, python_module);
+    let app_config = app_config_definition_from_class(&bases, &class_def.body);
 
     index.add_class(ClassSymbol {
         source_file,
@@ -865,6 +1127,10 @@ fn collect_class(
         data_model,
         app: infer_django_app(module_path),
     });
+
+    if let Some(app_config) = app_config {
+        index.add_app_config(python_qualified_name.clone(), app_config);
+    }
 
     index.add_view(ViewSymbol {
         source_file,
@@ -968,6 +1234,60 @@ fn collect_routes_in_suite(
             import_index,
             statement,
         );
+    }
+}
+
+fn collect_settings_in_suite(
+    index: &mut DjangoProjectIndex,
+    source_file: Option<NodeIndex>,
+    _import_index: &ImportIndex,
+    suite: &ast::Suite,
+) {
+    let mut settings = DjangoSettingsModule {
+        source_file,
+        ..DjangoSettingsModule::default()
+    };
+
+    for statement in suite {
+        collect_settings_from_statement(&mut settings, statement);
+    }
+
+    index.add_settings_module(settings);
+}
+
+fn collect_settings_from_statement(settings: &mut DjangoSettingsModule, statement: &Stmt) {
+    match statement {
+        Stmt::Assign(assign) => {
+            for target in &assign.targets {
+                collect_settings_assignment(settings, target, &assign.value);
+            }
+        }
+        Stmt::AnnAssign(assign) => {
+            if let Some(value) = &assign.value {
+                collect_settings_assignment(settings, &assign.target, value);
+            }
+        }
+        Stmt::AugAssign(assign) => {
+            collect_settings_assignment(settings, &assign.target, &assign.value);
+        }
+        _ => {}
+    }
+}
+
+fn collect_settings_assignment(settings: &mut DjangoSettingsModule, target: &Expr, value: &Expr) {
+    let Some(target_name) = target_name(target) else {
+        return;
+    };
+
+    match target_name {
+        "INSTALLED_APPS" => settings.installed_apps.extend(string_values(value)),
+        "MIDDLEWARE" | "MIDDLEWARE_CLASSES" => settings.middleware.extend(string_values(value)),
+        "ROOT_URLCONF" => {
+            if let Some(root_urlconf) = string_constant(value) {
+                settings.root_urlconf = Some(root_urlconf);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1085,6 +1405,17 @@ fn collect_raw_routes_from_expr(
         Expr::Call(call) => {
             if let Some((route, target)) = route_call(call, python_module, import_index) {
                 index.add_raw_route(source_file, module_path, python_module, route, target);
+            } else if is_route_list_factory_call(call, import_index) {
+                for arg in &call.args {
+                    collect_raw_routes_from_expr(
+                        index,
+                        source_file,
+                        module_path,
+                        python_module,
+                        import_index,
+                        arg,
+                    );
+                }
             }
         }
         Expr::Attribute(_) => {
@@ -1098,6 +1429,14 @@ fn collect_raw_routes_from_expr(
                 );
             }
         }
+        Expr::Starred(starred) => collect_raw_routes_from_expr(
+            index,
+            source_file,
+            module_path,
+            python_module,
+            import_index,
+            &starred.value,
+        ),
         _ => {}
     }
 }
@@ -1251,7 +1590,21 @@ fn is_django_route_function(value: &str) -> bool {
 }
 
 fn is_django_include_function(value: &str) -> bool {
-    matches!(value, "django.urls.include" | "include")
+    matches!(
+        value,
+        "django.urls.include" | "django.conf.urls.include" | "include"
+    )
+}
+
+fn is_route_list_factory_call(call: &ast::ExprCall, import_index: &ImportIndex) -> bool {
+    expr_dotted_name(&call.func)
+        .map(|function_name| import_index.resolve(&function_name))
+        .is_some_and(|function_name| {
+            matches!(
+                function_name.as_str(),
+                "django.conf.urls.i18n.i18n_patterns" | "i18n_patterns"
+            )
+        })
 }
 
 fn keyword_value<'a>(keywords: &'a [ast::Keyword], name: &str) -> Option<&'a Expr> {
@@ -1270,6 +1623,23 @@ fn string_constant(expr: &Expr) -> Option<String> {
             Constant::Str(value) => Some(value.clone()),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn string_values(expr: &Expr) -> Vec<String> {
+    match expr {
+        Expr::Constant(_) => string_constant(expr).into_iter().collect(),
+        Expr::List(list) => list.elts.iter().filter_map(string_constant).collect(),
+        Expr::Tuple(tuple) => tuple.elts.iter().filter_map(string_constant).collect(),
+        Expr::Set(set) => set.elts.iter().filter_map(string_constant).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn target_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Name(name) => Some(name.id.as_str()),
         _ => None,
     }
 }
@@ -2216,6 +2586,45 @@ fn expr_model_reference(expr: &Expr, import_index: &ImportIndex) -> Option<Model
     }
 }
 
+fn app_config_definition_from_class(
+    bases: &[ModelReference],
+    suite: &ast::Suite,
+) -> Option<AppConfigDefinition> {
+    if !bases.iter().any(|base| is_app_config_base(&base.value)) {
+        return None;
+    }
+
+    Some(AppConfigDefinition {
+        name: class_string_attribute(suite, "name"),
+        label: class_string_attribute(suite, "label"),
+    })
+}
+
+fn is_app_config_base(value: &str) -> bool {
+    matches!(value, "django.apps.AppConfig" | "AppConfig")
+}
+
+fn class_string_attribute(suite: &ast::Suite, attribute_name: &str) -> Option<String> {
+    suite.iter().find_map(|statement| match statement {
+        Stmt::Assign(assign)
+            if assign
+                .targets
+                .iter()
+                .any(|target| is_target(target, attribute_name)) =>
+        {
+            string_constant(&assign.value)
+        }
+        Stmt::AnnAssign(assign) if is_target(&assign.target, attribute_name) => {
+            assign.value.as_deref().and_then(string_constant)
+        }
+        _ => None,
+    })
+}
+
+fn is_target(expr: &Expr, name: &str) -> bool {
+    target_name(expr).is_some_and(|target| target == name)
+}
+
 fn infer_django_app(module_path: &str) -> Option<DjangoApp> {
     let path = Path::new(module_path);
     let components = path
@@ -2245,6 +2654,32 @@ fn infer_django_app(module_path: &str) -> Option<DjangoApp> {
         label,
         path,
     })
+}
+
+fn app_module_from_installed_app(value: &str) -> String {
+    value
+        .split_once(".apps.")
+        .map_or(value, |(module, _)| module)
+        .to_owned()
+}
+
+fn app_for_python_module(apps: &[DjangoApp], python_module: &str) -> Option<DjangoApp> {
+    let mut apps = apps.iter().collect::<Vec<_>>();
+
+    apps.sort_by_key(|app| std::cmp::Reverse(app.identifier.len()));
+
+    apps.into_iter()
+        .find(|app| {
+            python_module == app.identifier
+                || python_module
+                    .strip_prefix(&app.identifier)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        })
+        .cloned()
+}
+
+fn last_dotted_segment(value: &str) -> &str {
+    value.rsplit_once('.').map_or(value, |(_, name)| name)
 }
 
 fn class_name(qualified_name: &str) -> &str {
@@ -2619,11 +3054,18 @@ urlpatterns = [
         let root_urls = project.write(
             "project/urls.py",
             r#"
-from django.urls import include, path
+from django.conf.urls import include
+from django.conf.urls.i18n import i18n_patterns
+from django.urls import path
 
 urlpatterns = [
     path("shop/", include("shop.urls")),
 ]
+
+urlpatterns += i18n_patterns(
+    path("localized/", include("localized.urls")),
+    prefix_default_language=True,
+)
 "#,
         );
         let shop_urls = project.write(
@@ -2746,6 +3188,204 @@ class ProductViewSet:
                 .iter()
                 .any(|node| node.node_type == NodeType::Url && node.label == "products/")
         );
+    }
+
+    #[test]
+    fn maps_runtime_settings_apps_root_urlconf_and_middleware() {
+        let project = TempProject::new("django-runtime-settings");
+        let settings = project.write(
+            "project/settings.py",
+            r#"
+INSTALLED_APPS = [
+    "shop.apps.ShopConfig",
+    "billing",
+]
+
+MIDDLEWARE = [
+    "django.middleware.security.SecurityMiddleware",
+    "project.middleware.TenantMiddleware",
+]
+
+ROOT_URLCONF = "project.urls"
+"#,
+        );
+        let app_config = project.write(
+            "shop/apps.py",
+            r#"
+from django.apps import AppConfig
+
+class ShopConfig(AppConfig):
+    name = "shop"
+    label = "commerce"
+"#,
+        );
+        let middleware = project.write(
+            "project/middleware.py",
+            r#"
+class TenantMiddleware:
+    pass
+"#,
+        );
+        let product_model = project.write(
+            "shop/models.py",
+            r#"
+from django.db import models
+
+class Product(models.Model):
+    pass
+"#,
+        );
+        let invoice_model = project.write(
+            "billing/models.py",
+            r#"
+from django.db import models
+
+class Invoice(models.Model):
+    product = models.ForeignKey("commerce.Product", on_delete=models.CASCADE)
+"#,
+        );
+        let root_urls = project.write(
+            "project/urls.py",
+            r#"
+from django.conf.urls import include
+from django.conf.urls.i18n import i18n_patterns
+from django.urls import path
+
+urlpatterns = [
+    path("shop/", include("shop.urls")),
+]
+
+urlpatterns += i18n_patterns(
+    path("localized/", include("localized.urls")),
+    prefix_default_language=True,
+)
+"#,
+        );
+        let shop_urls = project.write(
+            "shop/urls.py",
+            r#"
+from django.urls import path
+from .views import product_list
+
+urlpatterns = [
+    path("products/", product_list, name="products"),
+]
+"#,
+        );
+        let shop_views = project.write(
+            "shop/views.py",
+            r#"
+def product_list(request):
+    pass
+"#,
+        );
+        let localized_urls = project.write(
+            "localized/urls.py",
+            r#"
+from django.urls import path
+from .views import localized_view
+
+urlpatterns = [
+    path("", localized_view, name="localized"),
+]
+"#,
+        );
+        let localized_views = project.write(
+            "localized/views.py",
+            r#"
+def localized_view(request):
+    pass
+"#,
+        );
+        let unused_urls = project.write(
+            "unused/urls.py",
+            r#"
+from django.urls import path
+from .views import unused_view
+
+urlpatterns = [
+    path("unused/", unused_view, name="unused"),
+]
+"#,
+        );
+        let unused_views = project.write(
+            "unused/views.py",
+            r#"
+def unused_view(request):
+    pass
+"#,
+        );
+        let files = vec![
+            settings,
+            app_config,
+            middleware,
+            product_model,
+            invoice_model,
+            root_urls,
+            shop_urls,
+            shop_views,
+            localized_urls,
+            localized_views,
+            unused_urls,
+            unused_views,
+        ];
+        let report = parse_python_files(&files);
+
+        assert!(!report.has_diagnostics());
+
+        let graph = analyze_python_project(&project.path, &files, &report.modules);
+        let url_id = graph
+            .nodes
+            .iter()
+            .find(|node| node.node_type == NodeType::Url && node.label == "shop/products/")
+            .map(|node| node.id.clone())
+            .expect("configured root URL should expand included shop URL");
+        let localized_url_id = graph
+            .nodes
+            .iter()
+            .find(|node| node.node_type == NodeType::Url && node.label == "localized/")
+            .map(|node| node.id.clone())
+            .expect("i18n_patterns should expand into configured root URLs");
+
+        assert_eq!(graph.node_count_by_type(NodeType::Middleware), 2);
+        assert_eq!(graph.edge_count_by_type(EdgeType::Intercepts), 4);
+        assert_eq!(graph.edge_count_by_type(EdgeType::RoutesTo), 2);
+        assert_eq!(graph.edge_count_by_type(EdgeType::RelatesTo), 1);
+        assert!(graph.nodes.iter().any(|node| {
+            node.id == "app:shop"
+                && node.label == "commerce"
+                && node.path.as_deref() == Some("shop")
+        }));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|node| node.node_type != NodeType::Url || node.label != "unused/")
+        );
+        assert!(graph.nodes.iter().any(|node| {
+            node.id == "middleware:project.middleware.TenantMiddleware"
+                && node.path.as_deref() == Some("project/middleware.py")
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "app:shop"
+                && edge.target == "model:shop/models.py:Product"
+                && edge.edge_type == EdgeType::Contains
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "middleware:project.middleware.TenantMiddleware"
+                && edge.target == url_id
+                && edge.edge_type == EdgeType::Intercepts
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "middleware:django.middleware.security.SecurityMiddleware"
+                && edge.target == url_id
+                && edge.edge_type == EdgeType::Intercepts
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "middleware:project.middleware.TenantMiddleware"
+                && edge.target == localized_url_id
+                && edge.edge_type == EdgeType::Intercepts
+        }));
     }
 
     #[test]
