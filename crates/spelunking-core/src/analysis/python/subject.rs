@@ -227,7 +227,9 @@ struct FunctionContext<'a> {
     class: Option<DiscoveredClass<'a>>,
     qualified_name: String,
     decorators: Vec<String>,
+    arg_names: Vec<String>,
     body: &'a ast::Suite,
+    is_async: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2065,7 +2067,9 @@ fn function_context_from_def<'a>(
         class,
         qualified_name,
         decorators: decorator_names(import_index, &function_def.decorator_list),
+        arg_names: argument_names(&function_def.args),
         body: &function_def.body,
+        is_async: false,
     }
 }
 
@@ -2088,7 +2092,9 @@ fn async_function_context_from_def<'a>(
         class,
         qualified_name,
         decorators: decorator_names(import_index, &function_def.decorator_list),
+        arg_names: argument_names(&function_def.args),
         body: &function_def.body,
+        is_async: true,
     }
 }
 
@@ -2100,6 +2106,28 @@ fn decorator_names(import_index: &ImportIndex, decorators: &[Expr]) -> Vec<Strin
             _ => expr_dotted_name(decorator),
         })
         .map(|name| import_index.resolve(&name))
+        .collect()
+}
+
+fn argument_names(arguments: &ast::Arguments) -> Vec<String> {
+    arguments
+        .posonlyargs
+        .iter()
+        .chain(arguments.args.iter())
+        .chain(arguments.kwonlyargs.iter())
+        .map(|argument| argument.def.arg.to_string())
+        .chain(
+            arguments
+                .vararg
+                .iter()
+                .map(|argument| argument.arg.to_string()),
+        )
+        .chain(
+            arguments
+                .kwarg
+                .iter()
+                .map(|argument| argument.arg.to_string()),
+        )
         .collect()
 }
 
@@ -2455,6 +2483,9 @@ fn collect_mutation_sites_from_expr(
     match expr {
         Expr::Call(call) => {
             push_queryset_update_mutation(sites, context, parts, model_class, call);
+            push_setattr_mutation(sites, context, parts, model_class, call);
+            push_bulk_update_mutation(sites, context, parts, model_class, call);
+            push_save_update_fields_mutation(sites, context, parts, model_class, call);
             collect_mutation_sites_from_expr(sites, context, parts, model_class, &call.func);
 
             for arg in &call.args {
@@ -2537,6 +2568,151 @@ fn collect_mutation_sites_from_expr(
     }
 }
 
+fn push_setattr_mutation(
+    sites: &mut Vec<DjangoMutationSite>,
+    context: &FunctionContext<'_>,
+    parts: &SubjectParts,
+    model_class: &DiscoveredClass<'_>,
+    call: &ast::ExprCall,
+) {
+    if expr_dotted_name(&call.func).as_deref().map(class_name) != Some("setattr") {
+        return;
+    }
+
+    let Some(target) = call.args.first() else {
+        return;
+    };
+    let Some(field_name) = call.args.get(1).and_then(string_constant) else {
+        return;
+    };
+
+    if field_name != parts.field_name {
+        return;
+    }
+
+    let Some(confidence) = receiver_confidence(target, context, parts, model_class) else {
+        return;
+    };
+    let line = line_for_node(context.module, call);
+    let value = call
+        .args
+        .get(2)
+        .map(|value| expression_label(context.module, value));
+
+    sites.push(DjangoMutationSite {
+        kind: "setattr".to_owned(),
+        container_kind: context_kind(context, parts, model_class),
+        container_name: context.qualified_name.clone(),
+        path: context.module_path.clone(),
+        line,
+        evidence: source_line(context.module, line),
+        mutation: format!(
+            "setattr({}, {:?}, {})",
+            expression_label(context.module, target),
+            field_name,
+            value.as_deref().unwrap_or("<unknown>")
+        ),
+        value,
+        confidence,
+    });
+}
+
+fn push_bulk_update_mutation(
+    sites: &mut Vec<DjangoMutationSite>,
+    context: &FunctionContext<'_>,
+    parts: &SubjectParts,
+    model_class: &DiscoveredClass<'_>,
+    call: &ast::ExprCall,
+) {
+    if expr_dotted_name(&call.func).as_deref().map(class_name) != Some("bulk_update") {
+        return;
+    }
+
+    let fields_expr = call
+        .args
+        .get(1)
+        .or_else(|| keyword_arg_expr(&call.keywords, "fields"));
+    let Some(fields_expr) = fields_expr else {
+        return;
+    };
+
+    if !expr_contains_string(fields_expr, &parts.field_name) {
+        return;
+    }
+
+    let receiver = bulk_update_receiver(call);
+    let confidence = if receiver
+        .as_ref()
+        .is_some_and(|receiver| expr_references_model(receiver, &parts.model_name))
+    {
+        "high".to_owned()
+    } else if context_mentions_subject(context, parts)
+        || call
+            .args
+            .first()
+            .is_some_and(|arg| collection_name_suggests_model(arg, &parts.model_name))
+    {
+        "medium".to_owned()
+    } else {
+        return;
+    };
+    let line = line_for_node(context.module, call);
+
+    sites.push(DjangoMutationSite {
+        kind: "bulk_update".to_owned(),
+        container_kind: context_kind(context, parts, model_class),
+        container_name: context.qualified_name.clone(),
+        path: context.module_path.clone(),
+        line,
+        evidence: source_line(context.module, line),
+        mutation: format!("bulk_update(..., fields=[{}])", parts.field_name),
+        value: None,
+        confidence,
+    });
+}
+
+fn push_save_update_fields_mutation(
+    sites: &mut Vec<DjangoMutationSite>,
+    context: &FunctionContext<'_>,
+    parts: &SubjectParts,
+    model_class: &DiscoveredClass<'_>,
+    call: &ast::ExprCall,
+) {
+    let Expr::Attribute(function) = call.func.as_ref() else {
+        return;
+    };
+
+    if function.attr.as_str() != "save" {
+        return;
+    }
+
+    let Some(update_fields) = keyword_arg_expr(&call.keywords, "update_fields") else {
+        return;
+    };
+
+    if !expr_contains_string(update_fields, &parts.field_name) {
+        return;
+    }
+
+    let Some(confidence) = receiver_confidence(&function.value, context, parts, model_class) else {
+        return;
+    };
+    let line = line_for_node(context.module, call);
+    let receiver = expression_label(context.module, &function.value);
+
+    sites.push(DjangoMutationSite {
+        kind: "save_update_fields".to_owned(),
+        container_kind: context_kind(context, parts, model_class),
+        container_name: context.qualified_name.clone(),
+        path: context.module_path.clone(),
+        line,
+        evidence: source_line(context.module, line),
+        mutation: format!("{receiver}.save(update_fields=[{}])", parts.field_name),
+        value: None,
+        confidence,
+    });
+}
+
 fn push_queryset_update_mutation(
     sites: &mut Vec<DjangoMutationSite>,
     context: &FunctionContext<'_>,
@@ -2583,6 +2759,69 @@ fn push_queryset_update_mutation(
         value: Some(value),
         confidence: confidence.to_owned(),
     });
+}
+
+fn receiver_confidence(
+    receiver: &Expr,
+    context: &FunctionContext<'_>,
+    parts: &SubjectParts,
+    model_class: &DiscoveredClass<'_>,
+) -> Option<String> {
+    if expr_references_model(receiver, &parts.model_name) {
+        return Some("high".to_owned());
+    }
+
+    let owner = expr_dotted_name(receiver)?;
+
+    if owner == "self"
+        && context
+            .class
+            .as_ref()
+            .is_some_and(|class| class.python_qualified_name == model_class.python_qualified_name)
+    {
+        return Some("high".to_owned());
+    }
+
+    if owner_suggests_model_instance(&owner, &parts.model_name) {
+        return Some("high".to_owned());
+    }
+
+    if likely_instance_alias(&owner) && context_mentions_subject(context, parts) {
+        return Some("medium".to_owned());
+    }
+
+    None
+}
+
+fn bulk_update_receiver(call: &ast::ExprCall) -> Option<&Expr> {
+    let Expr::Attribute(function) = call.func.as_ref() else {
+        return None;
+    };
+
+    Some(&function.value)
+}
+
+fn expr_contains_string(expr: &Expr, expected: &str) -> bool {
+    match expr {
+        Expr::Constant(_) => string_constant(expr).as_deref() == Some(expected),
+        Expr::List(list) => list
+            .elts
+            .iter()
+            .any(|value| expr_contains_string(value, expected)),
+        Expr::Tuple(tuple) => tuple
+            .elts
+            .iter()
+            .any(|value| expr_contains_string(value, expected)),
+        Expr::Set(set) => set
+            .elts
+            .iter()
+            .any(|value| expr_contains_string(value, expected)),
+        _ => false,
+    }
+}
+
+fn collection_name_suggests_model(expr: &Expr, model_name: &str) -> bool {
+    expr_dotted_name(expr).is_some_and(|name| owner_suggests_model_instance(&name, model_name))
 }
 
 fn context_kind(
@@ -2636,40 +2875,69 @@ fn context_kind(
         }
     }
 
+    if context.is_async {
+        return "async_function".to_owned();
+    }
+
     "function".to_owned()
 }
 
 fn is_task_context(context: &FunctionContext<'_>) -> bool {
-    context.module_path.ends_with("tasks.py")
+    has_task_decorator(context)
+        || context.module_path.ends_with("tasks.py")
         || context.module_path.contains("/tasks/")
-        || context.decorators.iter().any(|decorator| {
-            matches!(class_name(decorator), "shared_task" | "task") || decorator.ends_with(".task")
-        })
 }
 
 fn is_signal_context(context: &FunctionContext<'_>) -> bool {
-    context.module_path.ends_with("signals.py")
+    has_receiver_decorator(context)
+        || context.module_path.ends_with("signals.py")
         || context.module_path.contains("/signals/")
-        || context
-            .decorators
-            .iter()
-            .any(|decorator| class_name(decorator) == "receiver")
 }
 
 fn is_admin_context(context: &FunctionContext<'_>) -> bool {
-    context.module_path.ends_with("admin.py")
+    has_admin_action_decorator(context)
+        || context.module_path.ends_with("admin.py")
         || context.module_path.contains("/admin/")
         || context
             .class
             .as_ref()
-            .is_some_and(|class| class_name(&class.qualified_name).ends_with("Admin"))
+            .is_some_and(|class| class_is_model_admin(class))
 }
 
 fn is_webhook_context(context: &FunctionContext<'_>) -> bool {
     let path = context.module_path.to_ascii_lowercase();
     let name = context.qualified_name.to_ascii_lowercase();
 
-    path.contains("webhook") || name.contains("webhook")
+    (path.contains("webhook") || name.contains("webhook"))
+        && (context.arg_names.iter().any(|arg| arg == "request")
+            || context.class.as_ref().is_some_and(class_is_view))
+}
+
+fn has_task_decorator(context: &FunctionContext<'_>) -> bool {
+    context.decorators.iter().any(|decorator| {
+        matches!(class_name(decorator), "shared_task" | "task") || decorator.ends_with(".task")
+    })
+}
+
+fn has_receiver_decorator(context: &FunctionContext<'_>) -> bool {
+    context
+        .decorators
+        .iter()
+        .any(|decorator| class_name(decorator) == "receiver")
+}
+
+fn has_admin_action_decorator(context: &FunctionContext<'_>) -> bool {
+    context.decorators.iter().any(|decorator| {
+        decorator == "django.contrib.admin.action" || decorator.ends_with(".admin.action")
+    })
+}
+
+fn class_is_model_admin(class: &DiscoveredClass<'_>) -> bool {
+    class_name(&class.qualified_name).ends_with("Admin")
+        || class.class_def.bases.iter().any(|base| {
+            let name = resolved_base_name(base, &class.import_index);
+            name.ends_with("ModelAdmin") || name.ends_with(".admin.ModelAdmin")
+        })
 }
 
 fn is_management_command_context(context: &FunctionContext<'_>) -> bool {
@@ -2701,7 +2969,10 @@ fn owner_suggests_model_instance(owner: &str, model_name: &str) -> bool {
     let normalized_owner = normalize_token(owner);
     let normalized_model = normalize_token(model_name);
 
-    normalized_owner == normalized_model || normalized_owner.ends_with(&normalized_model)
+    normalized_owner == normalized_model
+        || normalized_owner == format!("{normalized_model}s")
+        || normalized_owner.ends_with(&normalized_model)
+        || normalized_owner.ends_with(&format!("{normalized_model}s"))
 }
 
 fn likely_instance_alias(owner: &str) -> bool {
@@ -3290,11 +3561,12 @@ fn collect_route_steps_from_expr(
                         .first()
                         .and_then(string_constant)
                         .unwrap_or_else(|| "<dynamic route>".to_owned());
+                    let route_name = route_display_name(call, &route);
                     let line = line_for_node(module, expr);
 
                     steps.push(DjangoBehaviorStep {
                         kind: "route".to_owned(),
-                        name: route,
+                        name: route_name,
                         path: module_path.to_owned(),
                         line,
                         evidence: source_line(module, line),
@@ -3318,6 +3590,54 @@ fn collect_route_steps_from_expr(
         }
         _ => {}
     }
+}
+
+fn route_display_name(call: &ast::ExprCall, route: &str) -> String {
+    let Some(target) = call.args.get(1) else {
+        return route.to_owned();
+    };
+    let actions = route_http_actions(target);
+
+    if actions.is_empty() {
+        route.to_owned()
+    } else {
+        actions
+            .into_iter()
+            .map(|(method, action)| {
+                format!("{} {} -> {}", method.to_ascii_uppercase(), route, action)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn route_http_actions(expr: &Expr) -> Vec<(String, String)> {
+    let Expr::Call(call) = expr else {
+        return Vec::new();
+    };
+
+    if expr_dotted_name(&call.func)
+        .as_deref()
+        .is_none_or(|name| class_name(name) != "as_view")
+    {
+        return Vec::new();
+    }
+
+    let Some(Expr::Dict(actions)) = call.args.first() else {
+        return Vec::new();
+    };
+
+    actions
+        .keys
+        .iter()
+        .zip(actions.values.iter())
+        .filter_map(|(method, action)| {
+            Some((
+                method.as_ref().and_then(string_constant)?,
+                string_constant(action)?,
+            ))
+        })
+        .collect()
 }
 
 fn subject_step(subject_report: &DjangoSubjectReport) -> Option<DjangoBehaviorStep> {
@@ -3345,6 +3665,7 @@ fn behavior_path_kind(container_kind: &str) -> &'static str {
         "admin_action" => "admin_path",
         "webhook" => "webhook_path",
         "management_command" => "management_path",
+        "async_function" => "async_path",
         "model_method" => "model_path",
         _ => "behavior_path",
     }
@@ -3700,6 +4021,9 @@ class Reservation(models.Model):
 
     def cancel(self):
         self.status = self.CANCELLED
+
+    def persist_status(self):
+        self.save(update_fields=["status"])
 "#,
         );
         let serializers = project.write(
@@ -3730,6 +4054,10 @@ class ReservationViewSet(ModelViewSet):
         reservation = Reservation.objects.get(pk=pk)
         reservation.status = Reservation.CANCELLED
         reservation.save()
+
+def reservation_webhook(request):
+    reservation = Reservation.objects.get(pk=request.POST["id"])
+    setattr(reservation, "status", Reservation.CANCELLED)
 "#,
         );
         let urls = project.write(
@@ -3752,9 +4080,34 @@ from .models import Reservation
 @shared_task
 def expire_pending_reservations():
     Reservation.objects.filter(status=Reservation.PENDING).update(status=Reservation.EXPIRED)
+    Reservation.objects.bulk_update([], ["status"])
 "#,
         );
-        let report = parse_python_files(&[models, serializers, views, urls, tasks]);
+        let signals = project.write(
+            "reservations/signals.py",
+            r#"
+from django.db.models.signals import pre_save
+from django.dispatch import receiver
+from .models import Reservation
+
+@receiver(pre_save, sender=Reservation)
+def normalize_reservation_status(sender, instance, **kwargs):
+    if isinstance(instance, Reservation):
+        instance.status = Reservation.PENDING
+"#,
+        );
+        let admin = project.write(
+            "reservations/admin.py",
+            r#"
+from django.contrib import admin
+from .models import Reservation
+
+@admin.action(description="Cancel reservations")
+def mark_cancelled(modeladmin, request, queryset):
+    queryset.update(status=Reservation.CANCELLED)
+"#,
+        );
+        let report = parse_python_files(&[models, serializers, views, urls, tasks, signals, admin]);
         let behavior =
             inspect_django_behavior(&project.path, &report.modules, "Reservation.status")
                 .expect("behavior inspection should succeed");
@@ -3775,11 +4128,35 @@ def expire_pending_reservations():
         );
         assert!(
             behavior
-                .behavior_paths
+                .mutation_sites
                 .iter()
-                .any(|path| path.kind == "api_path"
-                    && path.steps.iter().any(|step| step.kind == "route"))
+                .any(|site| site.container_kind == "task" && site.kind == "bulk_update")
         );
+        assert!(
+            behavior
+                .mutation_sites
+                .iter()
+                .any(|site| site.container_kind == "webhook" && site.kind == "setattr")
+        );
+        assert!(behavior.mutation_sites.iter().any(|site| {
+            site.container_kind == "model_method" && site.kind == "save_update_fields"
+        }));
+        assert!(behavior.mutation_sites.iter().any(|site| {
+            site.container_kind == "signal_handler" && site.kind == "direct_assignment"
+        }));
+        assert!(
+            behavior
+                .mutation_sites
+                .iter()
+                .any(|site| site.container_kind == "admin_action" && site.kind == "queryset_update")
+        );
+        assert!(behavior.behavior_paths.iter().any(|path| {
+            path.kind == "api_path"
+                && path
+                    .steps
+                    .iter()
+                    .any(|step| step.kind == "route" && step.name.contains("POST"))
+        }));
         assert!(
             behavior
                 .behavior_paths
