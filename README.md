@@ -47,7 +47,12 @@ cargo run -p spelunking-cli -- /path/to/django-project \
 Current Django analysis includes:
 
 - model discovery through direct and inherited Django model bases
+- model metadata for `Meta` options, including `abstract` and `proxy`
+- model manager discovery from `models.Manager`, custom manager classes, and `as_manager()`
 - direct ORM relationships through `ForeignKey`, `OneToOneField`, and `ManyToManyField`
+- field-level relationship attributes, including `through=...` and `related_name`
+- reverse ORM relationship edges
+- generic relation nodes for `GenericForeignKey`
 - URL route discovery from `path(...)`, `re_path(...)`, and legacy `url(...)`
 - function views and class-based views through `.as_view()`
 - basic `include(...)` expansion

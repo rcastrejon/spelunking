@@ -4,7 +4,7 @@ use petgraph::{
 };
 use serde::Serialize;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     str::FromStr,
@@ -16,6 +16,8 @@ pub enum NodeType {
     SourceFile,
     App,
     Model,
+    Manager,
+    GenericRelation,
     View,
     Url,
     Serializer,
@@ -28,10 +30,12 @@ pub enum NodeType {
 }
 
 impl NodeType {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::SourceFile,
         Self::App,
         Self::Model,
+        Self::Manager,
+        Self::GenericRelation,
         Self::View,
         Self::Url,
         Self::Serializer,
@@ -48,6 +52,8 @@ impl NodeType {
             Self::SourceFile => "source_file",
             Self::App => "app",
             Self::Model => "model",
+            Self::Manager => "manager",
+            Self::GenericRelation => "generic_relation",
             Self::View => "view",
             Self::Url => "url",
             Self::Serializer => "serializer",
@@ -101,10 +107,12 @@ pub enum EdgeType {
     Triggers,
     Intercepts,
     RelatesTo,
+    ReverseRelatesTo,
+    UsesManager,
 }
 
 impl EdgeType {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::Contains,
         Self::Calls,
         Self::Inherits,
@@ -114,6 +122,8 @@ impl EdgeType {
         Self::Triggers,
         Self::Intercepts,
         Self::RelatesTo,
+        Self::ReverseRelatesTo,
+        Self::UsesManager,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -127,6 +137,8 @@ impl EdgeType {
             Self::Triggers => "triggers",
             Self::Intercepts => "intercepts",
             Self::RelatesTo => "relates_to",
+            Self::ReverseRelatesTo => "reverse_relates_to",
+            Self::UsesManager => "uses_manager",
         }
     }
 }
@@ -182,6 +194,8 @@ pub struct Node {
     pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attributes: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -190,6 +204,8 @@ pub struct Edge {
     pub target: String,
     #[serde(rename = "type")]
     pub edge_type: EdgeType,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attributes: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -316,16 +332,17 @@ where
         .join(", ")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct EdgeData {
     edge_type: EdgeType,
+    attributes: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default)]
 pub struct GraphBuilder {
     graph: DiGraph<Node, EdgeData>,
     indices_by_key: HashMap<NodeKey, NodeIndex>,
-    edge_keys: HashSet<(usize, usize, EdgeType)>,
+    edge_keys: HashSet<(usize, usize, EdgeType, Vec<(String, String)>)>,
 }
 
 impl GraphBuilder {
@@ -339,7 +356,18 @@ impl GraphBuilder {
         label: impl Into<String>,
         path: Option<String>,
     ) -> NodeIndex {
+        self.add_node_with_attributes(key, label, path, BTreeMap::new())
+    }
+
+    pub fn add_node_with_attributes(
+        &mut self,
+        key: NodeKey,
+        label: impl Into<String>,
+        path: Option<String>,
+        attributes: BTreeMap<String, String>,
+    ) -> NodeIndex {
         if let Some(index) = self.indices_by_key.get(&key) {
+            self.graph[*index].attributes.extend(attributes);
             return *index;
         }
 
@@ -348,6 +376,7 @@ impl GraphBuilder {
             node_type: key.node_type,
             label: label.into(),
             path,
+            attributes,
         };
         let index = self.graph.add_node(node);
 
@@ -356,11 +385,33 @@ impl GraphBuilder {
     }
 
     pub fn add_edge(&mut self, source: NodeIndex, target: NodeIndex, edge_type: EdgeType) {
+        self.add_edge_with_attributes(source, target, edge_type, BTreeMap::new());
+    }
+
+    pub fn add_edge_with_attributes(
+        &mut self,
+        source: NodeIndex,
+        target: NodeIndex,
+        edge_type: EdgeType,
+        attributes: BTreeMap<String, String>,
+    ) {
+        let attribute_key = attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+
         if self
             .edge_keys
-            .insert((source.index(), target.index(), edge_type))
+            .insert((source.index(), target.index(), edge_type, attribute_key))
         {
-            self.graph.add_edge(source, target, EdgeData { edge_type });
+            self.graph.add_edge(
+                source,
+                target,
+                EdgeData {
+                    edge_type,
+                    attributes,
+                },
+            );
         }
     }
 
@@ -385,6 +436,7 @@ impl GraphBuilder {
                 source: self.graph[edge.source()].id.clone(),
                 target: self.graph[edge.target()].id.clone(),
                 edge_type: edge.weight().edge_type,
+                attributes: edge.weight().attributes.clone(),
             })
             .collect();
 
@@ -560,18 +612,21 @@ mod tests {
                     node_type: NodeType::Url,
                     label: "products/".to_owned(),
                     path: Some("shop/urls.py".to_owned()),
+                    attributes: BTreeMap::new(),
                 },
                 Node {
                     id: "view:shop.views.index".to_owned(),
                     node_type: NodeType::View,
                     label: "index".to_owned(),
                     path: Some("shop/views.py".to_owned()),
+                    attributes: BTreeMap::new(),
                 },
                 Node {
                     id: "model:shop/models.py:Product".to_owned(),
                     node_type: NodeType::Model,
                     label: "Product".to_owned(),
                     path: Some("shop/models.py".to_owned()),
+                    attributes: BTreeMap::new(),
                 },
             ],
             edges: vec![
@@ -579,11 +634,13 @@ mod tests {
                     source: "url:products/".to_owned(),
                     target: "view:shop.views.index".to_owned(),
                     edge_type: EdgeType::RoutesTo,
+                    attributes: BTreeMap::new(),
                 },
                 Edge {
                     source: "view:shop.views.index".to_owned(),
                     target: "model:shop/models.py:Product".to_owned(),
                     edge_type: EdgeType::Queries,
+                    attributes: BTreeMap::new(),
                 },
             ],
         };
@@ -610,12 +667,14 @@ mod tests {
                     node_type: NodeType::Model,
                     label: "Product".to_owned(),
                     path: Some("shop/models.py".to_owned()),
+                    attributes: BTreeMap::new(),
                 },
                 Node {
                     id: "model:billing/models.py:Invoice".to_owned(),
                     node_type: NodeType::Model,
                     label: "Invoice".to_owned(),
                     path: Some("billing/models.py".to_owned()),
+                    attributes: BTreeMap::new(),
                 },
             ],
             edges: Vec::new(),

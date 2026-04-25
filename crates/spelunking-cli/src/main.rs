@@ -160,6 +160,16 @@ fn write_summary(
     )?;
     writeln!(
         output,
+        "Django managers: {}",
+        graph.node_count_by_type(NodeType::Manager)
+    )?;
+    writeln!(
+        output,
+        "Django generic relations: {}",
+        graph.node_count_by_type(NodeType::GenericRelation)
+    )?;
+    writeln!(
+        output,
         "Django URLs: {}",
         graph.node_count_by_type(NodeType::Url)
     )?;
@@ -217,6 +227,16 @@ fn write_summary(
         output,
         "Model relationship edges: {}",
         graph.edge_count_by_type(EdgeType::RelatesTo)
+    )?;
+    writeln!(
+        output,
+        "Reverse relationship edges: {}",
+        graph.edge_count_by_type(EdgeType::ReverseRelatesTo)
+    )?;
+    writeln!(
+        output,
+        "Manager usage edges: {}",
+        graph.edge_count_by_type(EdgeType::UsesManager)
     )?;
     writeln!(
         output,
@@ -311,7 +331,7 @@ fn write_dot(output: &mut dyn Write, graph: &GraphExport) -> io::Result<()> {
 }
 
 fn write_dot_node(output: &mut dyn Write, node: &Node) -> io::Result<()> {
-    let label = format!("{}\n{}", node.label, node.node_type.as_str());
+    let label = dot_node_label(node);
     let mut attributes = vec![
         dot_attribute("label", &label),
         dot_attribute("id", &node.id),
@@ -323,6 +343,13 @@ fn write_dot_node(output: &mut dyn Write, node: &Node) -> io::Result<()> {
         attributes.push(dot_attribute("tooltip", path));
     }
 
+    for (key, value) in &node.attributes {
+        attributes.push(dot_attribute(
+            &format!("data_{}", dot_attribute_name(key)),
+            value,
+        ));
+    }
+
     writeln!(
         output,
         "  \"{}\" [{}];",
@@ -332,19 +359,58 @@ fn write_dot_node(output: &mut dyn Write, node: &Node) -> io::Result<()> {
 }
 
 fn write_dot_edge(output: &mut dyn Write, edge: &Edge) -> io::Result<()> {
+    let mut attributes = vec![dot_attribute("label", &dot_edge_label(edge))];
+
+    for (key, value) in &edge.attributes {
+        attributes.push(dot_attribute(
+            &format!("data_{}", dot_attribute_name(key)),
+            value,
+        ));
+    }
+
     writeln!(
         output,
         "  \"{}\" -> \"{}\" [{}];",
         dot_escape(&edge.source),
         dot_escape(&edge.target),
-        dot_attribute("label", edge.edge_type.as_str())
+        attributes.join(", ")
     )
+}
+
+fn dot_node_label(node: &Node) -> String {
+    let mut lines = vec![node.label.clone(), node.node_type.as_str().to_owned()];
+
+    for flag in ["abstract", "proxy"] {
+        if node
+            .attributes
+            .get(flag)
+            .is_some_and(|value| value == "true")
+        {
+            lines.push(flag.to_owned());
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn dot_edge_label(edge: &Edge) -> String {
+    let mut parts = vec![edge.edge_type.as_str().to_owned()];
+
+    for key in ["field", "kind", "through", "accessor"] {
+        if let Some(value) = edge.attributes.get(key) {
+            parts.push(format!("{key}: {value}"));
+        }
+    }
+
+    parts.join("\n")
 }
 
 fn dot_node_shape(node_type: NodeType) -> &'static str {
     match node_type {
         NodeType::SourceFile => "note",
         NodeType::App => "component",
+        NodeType::Manager => "folder",
+        NodeType::GenericRelation => "diamond",
         NodeType::Url => "oval",
         NodeType::Signal => "diamond",
         NodeType::Task => "hexagon",
@@ -371,6 +437,19 @@ fn dot_escape(value: &str) -> String {
             '\n' => "\\n".chars().collect(),
             '\r' => "\\r".chars().collect(),
             _ => vec![character],
+        })
+        .collect()
+}
+
+fn dot_attribute_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
         })
         .collect()
 }

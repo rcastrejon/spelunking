@@ -8,7 +8,7 @@ use rustpython_parser::ast::{
     self, Constant, Expr, Stmt, StmtAsyncFunctionDef, StmtClassDef, StmtFunctionDef,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
 };
 
@@ -42,6 +42,9 @@ struct ClassSymbol {
     python_qualified_name: String,
     bases: Vec<ModelReference>,
     relationships: Vec<ModelRelationship>,
+    generic_relations: Vec<GenericRelationField>,
+    managers: Vec<ModelManager>,
+    meta_options: ModelMetaOptions,
     data_model: Option<ModelReference>,
     app: Option<DjangoApp>,
 }
@@ -184,7 +187,62 @@ impl ModelReference {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelRelationship {
+    field_name: Option<String>,
+    kind: ModelRelationshipKind,
     target: ModelReference,
+    through: Option<ModelReference>,
+    related_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelRelationshipKind {
+    ForeignKey,
+    OneToOne,
+    ManyToMany,
+}
+
+impl ModelRelationshipKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ForeignKey => "foreign_key",
+            Self::OneToOne => "one_to_one",
+            Self::ManyToMany => "many_to_many",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GenericRelationField {
+    field_name: Option<String>,
+    content_type_field: Option<String>,
+    object_id_field: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelManager {
+    field_name: String,
+    manager: ModelReference,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ModelMetaOptions {
+    options: BTreeMap<String, String>,
+}
+
+impl ModelMetaOptions {
+    fn is_abstract(&self) -> bool {
+        self.bool_option("abstract")
+    }
+
+    fn is_proxy(&self) -> bool {
+        self.bool_option("proxy")
+    }
+
+    fn bool_option(&self, name: &str) -> bool {
+        self.options
+            .get(name)
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -782,10 +840,11 @@ impl DjangoProjectIndex {
 
         for &class_index in &model_class_indices {
             let class = &self.classes[class_index];
-            let model = graph.add_node(
+            let model = graph.add_node_with_attributes(
                 class.model_node_key(),
                 class.qualified_name.clone(),
                 Some(class.module_path.clone()),
+                model_node_attributes(class),
             );
 
             model_nodes.insert(class_index, model);
@@ -820,8 +879,74 @@ impl DjangoProjectIndex {
                     self.resolve_model_reference(class_index, &relationship.target)
                     && let Some(&target_model) = model_nodes.get(&target_index)
                 {
-                    graph.add_edge(model, target_model, EdgeType::RelatesTo);
+                    graph.add_edge_with_attributes(
+                        model,
+                        target_model,
+                        EdgeType::RelatesTo,
+                        relationship_edge_attributes(relationship),
+                    );
+
+                    if relationship.related_name.as_deref() != Some("+") {
+                        graph.add_edge_with_attributes(
+                            target_model,
+                            model,
+                            EdgeType::ReverseRelatesTo,
+                            reverse_relationship_edge_attributes(class, relationship),
+                        );
+                    }
                 }
+
+                if let Some(through) = &relationship.through
+                    && let Some(through_index) = self.resolve_model_reference(class_index, through)
+                    && let Some(&through_model) = model_nodes.get(&through_index)
+                {
+                    graph.add_edge_with_attributes(
+                        model,
+                        through_model,
+                        EdgeType::RelatesTo,
+                        through_relationship_edge_attributes(relationship),
+                    );
+                }
+            }
+
+            for generic_relation in &class.generic_relations {
+                let node = graph.add_node_with_attributes(
+                    NodeKey::new(
+                        NodeType::GenericRelation,
+                        format!(
+                            "{}:{}",
+                            class.model_identifier(),
+                            generic_relation
+                                .field_name
+                                .as_deref()
+                                .unwrap_or("generic_foreign_key")
+                        ),
+                    ),
+                    generic_relation
+                        .field_name
+                        .clone()
+                        .unwrap_or_else(|| "GenericForeignKey".to_owned()),
+                    Some(class.module_path.clone()),
+                    generic_relation_node_attributes(generic_relation),
+                );
+
+                graph.add_edge_with_attributes(
+                    model,
+                    node,
+                    EdgeType::RelatesTo,
+                    generic_relation_edge_attributes(generic_relation),
+                );
+            }
+
+            for manager in &class.managers {
+                let manager_node = self.manager_node_for_reference(graph, class_index, manager);
+
+                graph.add_edge_with_attributes(
+                    model,
+                    manager_node,
+                    EdgeType::UsesManager,
+                    manager_edge_attributes(manager),
+                );
             }
         }
 
@@ -1438,6 +1563,38 @@ impl DjangoProjectIndex {
 
         None
     }
+
+    fn manager_node_for_reference(
+        &self,
+        graph: &mut GraphBuilder,
+        class_index: usize,
+        manager: &ModelManager,
+    ) -> NodeIndex {
+        let class = &self.classes[class_index];
+
+        if let Some(manager_index) =
+            self.resolve_class_reference_in_module(&class.python_module, &manager.manager.value)
+        {
+            let manager_class = &self.classes[manager_index];
+
+            return graph.add_node_with_attributes(
+                NodeKey::new(
+                    NodeType::Manager,
+                    manager_class.python_qualified_name.clone(),
+                ),
+                manager_class.qualified_name.clone(),
+                Some(manager_class.module_path.clone()),
+                manager_node_attributes(manager_class),
+            );
+        }
+
+        graph.add_node_with_attributes(
+            NodeKey::new(NodeType::Manager, manager.manager.value.clone()),
+            class_name(&manager.manager.value).to_owned(),
+            None,
+            BTreeMap::from([("reference".to_owned(), manager.manager.value.clone())]),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1516,6 +1673,9 @@ fn collect_class(
         .filter_map(|base| expr_model_reference(base, import_index))
         .collect();
     let relationships = collect_relationships(&class_def.body, import_index);
+    let generic_relations = collect_generic_relations(&class_def.body, import_index);
+    let managers = collect_managers(&class_def.body, import_index);
+    let meta_options = collect_model_meta_options(&class_def.body, import_index);
     let data_model = collect_meta_model_reference(&class_def.body, import_index);
     let references = collect_symbol_references(&class_def.body, import_index, python_module);
     let app_config = app_config_definition_from_class(&bases, &class_def.body);
@@ -1528,6 +1688,9 @@ fn collect_class(
         python_qualified_name: python_qualified_name.clone(),
         bases,
         relationships,
+        generic_relations,
+        managers,
+        meta_options,
         data_model,
         app: infer_django_app(module_path),
     });
@@ -2247,18 +2410,43 @@ fn combine_route_patterns(prefix: &str, route: &str) -> String {
     }
 }
 
+fn collect_model_meta_options(suite: &ast::Suite, import_index: &ImportIndex) -> ModelMetaOptions {
+    let mut options = BTreeMap::new();
+
+    if let Some(meta_class) = suite.iter().find_map(meta_class_def) {
+        for statement in &meta_class.body {
+            match statement {
+                Stmt::Assign(assign) => {
+                    if let Some(value) = meta_option_value(&assign.value, import_index) {
+                        for name in assign.targets.iter().filter_map(target_name) {
+                            options.insert(name.to_owned(), value.clone());
+                        }
+                    }
+                }
+                Stmt::AnnAssign(assign) => {
+                    if let Some(name) = target_name(&assign.target)
+                        && let Some(value) = assign
+                            .value
+                            .as_deref()
+                            .and_then(|value| meta_option_value(value, import_index))
+                    {
+                        options.insert(name.to_owned(), value);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    ModelMetaOptions { options }
+}
+
 fn collect_meta_model_reference(
     suite: &ast::Suite,
     import_index: &ImportIndex,
 ) -> Option<ModelReference> {
     suite.iter().find_map(|statement| {
-        let Stmt::ClassDef(class_def) = statement else {
-            return None;
-        };
-
-        if class_def.name.as_str() != "Meta" {
-            return None;
-        }
+        let class_def = meta_class_def(statement)?;
 
         class_def.body.iter().find_map(|statement| match statement {
             Stmt::Assign(assign) if assign.targets.iter().any(is_model_meta_target) => {
@@ -2273,8 +2461,46 @@ fn collect_meta_model_reference(
     })
 }
 
+fn meta_class_def(statement: &Stmt) -> Option<&StmtClassDef> {
+    let Stmt::ClassDef(class_def) = statement else {
+        return None;
+    };
+
+    (class_def.name.as_str() == "Meta").then_some(class_def)
+}
+
 fn is_model_meta_target(expr: &Expr) -> bool {
     matches!(expr, Expr::Name(name) if name.id.as_str() == "model")
+}
+
+fn meta_option_value(expr: &Expr, import_index: &ImportIndex) -> Option<String> {
+    match expr {
+        Expr::Constant(constant) => match &constant.value {
+            Constant::Str(value) => Some(value.clone()),
+            Constant::Bool(value) => Some(value.to_string()),
+            Constant::Int(value) => Some(value.to_string()),
+            Constant::None => Some("None".to_owned()),
+            _ => None,
+        },
+        Expr::Name(_) | Expr::Attribute(_) => {
+            expr_dotted_name(expr).map(|name| import_index.resolve(&name))
+        }
+        Expr::List(list) => sequence_meta_option_value(&list.elts, import_index),
+        Expr::Tuple(tuple) => sequence_meta_option_value(&tuple.elts, import_index),
+        Expr::Set(set) => sequence_meta_option_value(&set.elts, import_index),
+        Expr::Call(call) => {
+            expr_dotted_name(&call.func).map(|name| format!("{}(...)", import_index.resolve(&name)))
+        }
+        _ => None,
+    }
+}
+
+fn sequence_meta_option_value(values: &[Expr], import_index: &ImportIndex) -> Option<String> {
+    values
+        .iter()
+        .map(|value| meta_option_value(value, import_index))
+        .collect::<Option<Vec<_>>>()
+        .map(|values| values.join(","))
 }
 
 fn collect_symbol_references(
@@ -3101,20 +3327,184 @@ fn reference_prefixes(reference: &str) -> Vec<&str> {
     prefixes
 }
 
+fn model_node_attributes(class: &ClassSymbol) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::new();
+
+    attributes.insert(
+        "abstract".to_owned(),
+        class.meta_options.is_abstract().to_string(),
+    );
+    attributes.insert(
+        "proxy".to_owned(),
+        class.meta_options.is_proxy().to_string(),
+    );
+
+    if !class.managers.is_empty() {
+        attributes.insert(
+            "managers".to_owned(),
+            class
+                .managers
+                .iter()
+                .map(|manager| format!("{}:{}", manager.field_name, manager.manager.value))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+
+    if !class.generic_relations.is_empty() {
+        attributes.insert(
+            "generic_foreign_keys".to_owned(),
+            class
+                .generic_relations
+                .iter()
+                .map(|relation| {
+                    relation
+                        .field_name
+                        .clone()
+                        .unwrap_or_else(|| "GenericForeignKey".to_owned())
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+
+    for (name, value) in &class.meta_options.options {
+        attributes.insert(format!("meta.{name}"), value.clone());
+    }
+
+    attributes
+}
+
+fn manager_node_attributes(class: &ClassSymbol) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "python_name".to_owned(),
+            class.python_qualified_name.clone(),
+        ),
+        ("module".to_owned(), class.python_module.clone()),
+    ])
+}
+
+fn relationship_edge_attributes(relationship: &ModelRelationship) -> BTreeMap<String, String> {
+    let mut attributes =
+        BTreeMap::from([("kind".to_owned(), relationship.kind.as_str().to_owned())]);
+
+    if let Some(field_name) = &relationship.field_name {
+        attributes.insert("field".to_owned(), field_name.clone());
+    }
+
+    if let Some(through) = &relationship.through {
+        attributes.insert("through".to_owned(), through.value.clone());
+    }
+
+    if let Some(related_name) = &relationship.related_name {
+        attributes.insert("related_name".to_owned(), related_name.clone());
+    }
+
+    attributes
+}
+
+fn reverse_relationship_edge_attributes(
+    class: &ClassSymbol,
+    relationship: &ModelRelationship,
+) -> BTreeMap<String, String> {
+    let mut attributes = relationship_edge_attributes(relationship);
+
+    attributes.insert("reverse".to_owned(), "true".to_owned());
+    attributes.insert("source_model".to_owned(), class.qualified_name.clone());
+    attributes.insert(
+        "accessor".to_owned(),
+        reverse_accessor_name(class, relationship),
+    );
+
+    attributes
+}
+
+fn reverse_accessor_name(class: &ClassSymbol, relationship: &ModelRelationship) -> String {
+    if let Some(related_name) = &relationship.related_name {
+        return related_name.clone();
+    }
+
+    let model_name = class_name(&class.qualified_name).to_ascii_lowercase();
+
+    match relationship.kind {
+        ModelRelationshipKind::OneToOne => model_name,
+        ModelRelationshipKind::ForeignKey | ModelRelationshipKind::ManyToMany => {
+            format!("{model_name}_set")
+        }
+    }
+}
+
+fn through_relationship_edge_attributes(
+    relationship: &ModelRelationship,
+) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::from([
+        ("kind".to_owned(), "through".to_owned()),
+        (
+            "relationship_kind".to_owned(),
+            relationship.kind.as_str().to_owned(),
+        ),
+    ]);
+
+    if let Some(field_name) = &relationship.field_name {
+        attributes.insert("field".to_owned(), field_name.clone());
+    }
+
+    attributes
+}
+
+fn generic_relation_node_attributes(
+    generic_relation: &GenericRelationField,
+) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::from([("kind".to_owned(), "generic_foreign_key".to_owned())]);
+
+    if let Some(content_type_field) = &generic_relation.content_type_field {
+        attributes.insert("content_type_field".to_owned(), content_type_field.clone());
+    }
+
+    if let Some(object_id_field) = &generic_relation.object_id_field {
+        attributes.insert("object_id_field".to_owned(), object_id_field.clone());
+    }
+
+    attributes
+}
+
+fn generic_relation_edge_attributes(
+    generic_relation: &GenericRelationField,
+) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::from([("kind".to_owned(), "generic_foreign_key".to_owned())]);
+
+    if let Some(field_name) = &generic_relation.field_name {
+        attributes.insert("field".to_owned(), field_name.clone());
+    }
+
+    attributes
+}
+
+fn manager_edge_attributes(manager: &ModelManager) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("field".to_owned(), manager.field_name.clone()),
+        ("manager".to_owned(), manager.manager.value.clone()),
+    ])
+}
+
 fn collect_relationships(suite: &ast::Suite, import_index: &ImportIndex) -> Vec<ModelRelationship> {
     let mut relationships = Vec::new();
 
     for statement in suite {
         match statement {
             Stmt::Assign(assign) => {
-                if let Some(relationship) = relationship_from_expr(&assign.value, import_index) {
+                if let Some(mut relationship) = relationship_from_expr(&assign.value, import_index)
+                {
+                    relationship.field_name = assign.targets.iter().find_map(assignment_name);
                     relationships.push(relationship);
                 }
             }
             Stmt::AnnAssign(assign) => {
                 if let Some(value) = &assign.value
-                    && let Some(relationship) = relationship_from_expr(value, import_index)
+                    && let Some(mut relationship) = relationship_from_expr(value, import_index)
                 {
+                    relationship.field_name = assignment_name(&assign.target);
                     relationships.push(relationship);
                 }
             }
@@ -3132,35 +3522,177 @@ fn relationship_from_expr(expr: &Expr, import_index: &ImportIndex) -> Option<Mod
 
     let field_type = expr_dotted_name(&call.func)?;
     let resolved_field_type = import_index.resolve(&field_type);
-
-    if !is_django_relationship_field(&resolved_field_type) {
-        return None;
-    }
+    let kind = django_relationship_kind(&resolved_field_type)?;
 
     let target_expr = call
         .args
         .first()
-        .or_else(|| call.keywords.iter().find_map(keyword_to_arg_expr))?;
+        .or_else(|| keyword_arg_expr(&call.keywords, "to"))?;
     let target = expr_model_reference(target_expr, import_index)?;
+    let through = keyword_arg_expr(&call.keywords, "through")
+        .and_then(|expr| expr_model_reference(expr, import_index));
+    let related_name = keyword_arg_expr(&call.keywords, "related_name").and_then(string_constant);
 
-    Some(ModelRelationship { target })
+    Some(ModelRelationship {
+        field_name: None,
+        kind,
+        target,
+        through,
+        related_name,
+    })
 }
 
-fn keyword_to_arg_expr(keyword: &ast::Keyword) -> Option<&Expr> {
-    if keyword.arg.as_ref().is_some_and(|arg| arg.as_str() == "to") {
-        Some(&keyword.value)
-    } else {
-        None
+fn keyword_arg_expr<'a>(keywords: &'a [ast::Keyword], name: &str) -> Option<&'a Expr> {
+    keywords
+        .iter()
+        .find(|keyword| keyword.arg.as_ref().is_some_and(|arg| arg.as_str() == name))
+        .map(|keyword| &keyword.value)
+}
+
+fn django_relationship_kind(value: &str) -> Option<ModelRelationshipKind> {
+    match value {
+        "django.db.models.ForeignKey" => Some(ModelRelationshipKind::ForeignKey),
+        "django.db.models.OneToOneField" => Some(ModelRelationshipKind::OneToOne),
+        "django.db.models.ManyToManyField" => Some(ModelRelationshipKind::ManyToMany),
+        _ => None,
     }
 }
 
-fn is_django_relationship_field(value: &str) -> bool {
+fn collect_generic_relations(
+    suite: &ast::Suite,
+    import_index: &ImportIndex,
+) -> Vec<GenericRelationField> {
+    let mut generic_relations = Vec::new();
+
+    for statement in suite {
+        match statement {
+            Stmt::Assign(assign) => {
+                if let Some(mut generic_relation) =
+                    generic_relation_from_expr(&assign.value, import_index)
+                {
+                    generic_relation.field_name = assign.targets.iter().find_map(assignment_name);
+                    generic_relations.push(generic_relation);
+                }
+            }
+            Stmt::AnnAssign(assign) => {
+                if let Some(value) = &assign.value
+                    && let Some(mut generic_relation) =
+                        generic_relation_from_expr(value, import_index)
+                {
+                    generic_relation.field_name = assignment_name(&assign.target);
+                    generic_relations.push(generic_relation);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    generic_relations
+}
+
+fn generic_relation_from_expr(
+    expr: &Expr,
+    import_index: &ImportIndex,
+) -> Option<GenericRelationField> {
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+
+    let field_type = expr_dotted_name(&call.func)?;
+    let resolved_field_type = import_index.resolve(&field_type);
+
+    if resolved_field_type != "django.contrib.contenttypes.fields.GenericForeignKey" {
+        return None;
+    }
+
+    let content_type_field = call
+        .args
+        .first()
+        .and_then(string_constant)
+        .or_else(|| keyword_arg_expr(&call.keywords, "ct_field").and_then(string_constant))
+        .or_else(|| {
+            keyword_arg_expr(&call.keywords, "content_type_field").and_then(string_constant)
+        });
+    let object_id_field = call
+        .args
+        .get(1)
+        .and_then(string_constant)
+        .or_else(|| keyword_arg_expr(&call.keywords, "fk_field").and_then(string_constant))
+        .or_else(|| keyword_arg_expr(&call.keywords, "object_id_field").and_then(string_constant));
+
+    Some(GenericRelationField {
+        field_name: None,
+        content_type_field,
+        object_id_field,
+    })
+}
+
+fn collect_managers(suite: &ast::Suite, import_index: &ImportIndex) -> Vec<ModelManager> {
+    let mut managers = Vec::new();
+
+    for statement in suite {
+        match statement {
+            Stmt::Assign(assign) => {
+                if let Some(manager) = manager_reference_from_expr(&assign.value, import_index) {
+                    for field_name in assign.targets.iter().filter_map(assignment_name) {
+                        managers.push(ModelManager {
+                            field_name,
+                            manager: manager.clone(),
+                        });
+                    }
+                }
+            }
+            Stmt::AnnAssign(assign) => {
+                if let Some(value) = &assign.value
+                    && let Some(manager) = manager_reference_from_expr(value, import_index)
+                    && let Some(field_name) = assignment_name(&assign.target)
+                {
+                    managers.push(ModelManager {
+                        field_name,
+                        manager,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    managers
+}
+
+fn manager_reference_from_expr(expr: &Expr, import_index: &ImportIndex) -> Option<ModelReference> {
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+
+    let function_name = expr_dotted_name(&call.func)?;
+    let resolved_name = import_index.resolve(&function_name);
+
+    if is_manager_reference(&resolved_name) {
+        return Some(ModelReference::new(resolved_name));
+    }
+
+    if resolved_name.ends_with(".as_manager") {
+        return Some(ModelReference::new(resolved_name));
+    }
+
+    None
+}
+
+fn is_manager_reference(value: &str) -> bool {
     matches!(
         value,
-        "django.db.models.ForeignKey"
-            | "django.db.models.OneToOneField"
-            | "django.db.models.ManyToManyField"
-    )
+        "django.db.models.Manager"
+            | "django.db.models.QuerySet"
+            | "django.contrib.gis.db.models.Manager"
+    ) || class_name(value).ends_with("Manager")
+}
+
+fn assignment_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(name) => Some(name.id.to_string()),
+        _ => None,
+    }
 }
 
 fn expr_model_reference(expr: &Expr, import_index: &ImportIndex) -> Option<ModelReference> {
@@ -4332,6 +4864,172 @@ urlpatterns = [
             edge.source == "form:shop.forms.ProductForm"
                 && edge.target == "model:shop/models.py:Product"
                 && edge.edge_type == EdgeType::Serializes
+        }));
+    }
+
+    #[test]
+    fn annotates_model_meta_managers_and_generic_foreign_keys() {
+        let project = TempProject::new("django-model-rich-semantics");
+        let models = project.write(
+            "shop/models.py",
+            r#"
+from django.contrib.contenttypes.fields import GenericForeignKey
+from django.db import models
+
+class ActiveManager(models.Manager):
+    pass
+
+class TimeStamped(models.Model):
+    created_at = models.DateTimeField()
+
+    class Meta:
+        abstract = True
+        ordering = ["created_at"]
+        db_table = "timestamped"
+
+class Product(TimeStamped):
+    objects = ActiveManager()
+    content_object = GenericForeignKey("content_type", "object_id")
+
+    class Meta:
+        proxy = True
+        verbose_name = "product"
+"#,
+        );
+        let report = parse_python_files(std::slice::from_ref(&models));
+
+        assert!(!report.has_diagnostics());
+
+        let graph = analyze_python_project(&project.path, &[models], &report.modules);
+        let timestamped = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == "model:shop/models.py:TimeStamped")
+            .expect("abstract base model should be exported");
+        let product = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == "model:shop/models.py:Product")
+            .expect("proxy model should be exported");
+
+        assert_eq!(
+            timestamped.attributes.get("abstract").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            timestamped
+                .attributes
+                .get("meta.ordering")
+                .map(String::as_str),
+            Some("created_at")
+        );
+        assert_eq!(
+            timestamped
+                .attributes
+                .get("meta.db_table")
+                .map(String::as_str),
+            Some("timestamped")
+        );
+        assert_eq!(
+            product.attributes.get("proxy").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            product
+                .attributes
+                .get("generic_foreign_keys")
+                .map(String::as_str),
+            Some("content_object")
+        );
+        assert_eq!(graph.node_count_by_type(NodeType::Manager), 1);
+        assert_eq!(graph.node_count_by_type(NodeType::GenericRelation), 1);
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "model:shop/models.py:Product"
+                && edge.target == "manager:shop.models.ActiveManager"
+                && edge.edge_type == EdgeType::UsesManager
+                && edge.attributes.get("field").map(String::as_str) == Some("objects")
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "model:shop/models.py:Product"
+                && edge.edge_type == EdgeType::RelatesTo
+                && edge.attributes.get("kind").map(String::as_str) == Some("generic_foreign_key")
+                && edge.attributes.get("field").map(String::as_str) == Some("content_object")
+        }));
+    }
+
+    #[test]
+    fn preserves_field_level_relationships_through_models_and_reverse_edges() {
+        let project = TempProject::new("django-model-relation-semantics");
+        let models = project.write(
+            "shop/models.py",
+            r#"
+from django.db import models
+
+class User(models.Model):
+    pass
+
+class Order(models.Model):
+    buyer = models.ForeignKey(User, related_name="bought_orders", on_delete=models.CASCADE)
+    seller = models.ForeignKey(User, related_name="sold_orders", on_delete=models.CASCADE)
+
+class Tag(models.Model):
+    pass
+
+class ProductTag(models.Model):
+    pass
+
+class Product(models.Model):
+    tags = models.ManyToManyField(Tag, through="ProductTag", related_name="products")
+"#,
+        );
+        let report = parse_python_files(std::slice::from_ref(&models));
+
+        assert!(!report.has_diagnostics());
+
+        let graph = analyze_python_project(&project.path, &[models], &report.modules);
+        let order_to_user_edges = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.source == "model:shop/models.py:Order"
+                    && edge.target == "model:shop/models.py:User"
+                    && edge.edge_type == EdgeType::RelatesTo
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(order_to_user_edges.len(), 2);
+        assert!(order_to_user_edges.iter().any(|edge| {
+            edge.attributes.get("field").map(String::as_str) == Some("buyer")
+                && edge.attributes.get("kind").map(String::as_str) == Some("foreign_key")
+        }));
+        assert!(order_to_user_edges.iter().any(|edge| {
+            edge.attributes.get("field").map(String::as_str) == Some("seller")
+                && edge.attributes.get("kind").map(String::as_str) == Some("foreign_key")
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "model:shop/models.py:User"
+                && edge.target == "model:shop/models.py:Order"
+                && edge.edge_type == EdgeType::ReverseRelatesTo
+                && edge.attributes.get("accessor").map(String::as_str) == Some("bought_orders")
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "model:shop/models.py:User"
+                && edge.target == "model:shop/models.py:Order"
+                && edge.edge_type == EdgeType::ReverseRelatesTo
+                && edge.attributes.get("accessor").map(String::as_str) == Some("sold_orders")
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "model:shop/models.py:Product"
+                && edge.target == "model:shop/models.py:Tag"
+                && edge.edge_type == EdgeType::RelatesTo
+                && edge.attributes.get("field").map(String::as_str) == Some("tags")
+                && edge.attributes.get("through").map(String::as_str) == Some("ProductTag")
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "model:shop/models.py:Product"
+                && edge.target == "model:shop/models.py:ProductTag"
+                && edge.edge_type == EdgeType::RelatesTo
+                && edge.attributes.get("kind").map(String::as_str) == Some("through")
         }));
     }
 }
