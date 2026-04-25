@@ -102,6 +102,15 @@ fn print_summary(
         graph.node_count_by_type(NodeType::Middleware)
     );
     println!(
+        "Django signal handlers: {}",
+        graph.node_count_by_type(NodeType::Handler)
+    );
+    println!(
+        "Django signals: {}",
+        graph.node_count_by_type(NodeType::Signal)
+    );
+    println!("Django tasks: {}", graph.node_count_by_type(NodeType::Task));
+    println!(
         "Model inheritance edges: {}",
         graph.edge_count_by_type(EdgeType::Inherits)
     );
@@ -124,6 +133,10 @@ fn print_summary(
     println!(
         "Middleware intercept edges: {}",
         graph.edge_count_by_type(EdgeType::Intercepts)
+    );
+    println!(
+        "Trigger edges: {}",
+        graph.edge_count_by_type(EdgeType::Triggers)
     );
 
     if cli.list_files {

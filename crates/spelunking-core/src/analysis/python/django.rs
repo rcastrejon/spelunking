@@ -92,6 +92,27 @@ impl ViewSymbol {
     }
 }
 
+#[derive(Debug, Clone)]
+struct FunctionSymbol {
+    source_file: Option<NodeIndex>,
+    module_path: String,
+    python_module: String,
+    qualified_name: String,
+    python_qualified_name: String,
+    references: SymbolReferences,
+}
+
+impl FunctionSymbol {
+    fn handler_node_key(&self) -> NodeKey {
+        NodeKey::new(NodeType::Handler, self.python_qualified_name.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TaskSymbol {
+    function_index: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DjangoApp {
     identifier: String,
@@ -175,6 +196,41 @@ impl ViewReference {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallableReference {
+    value: String,
+}
+
+impl CallableReference {
+    fn new(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignalReference {
+    value: String,
+}
+
+impl SignalReference {
+    fn new(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SignalReceiver {
+    python_module: String,
+    signal: SignalReference,
+    sender: Option<ModelReference>,
+    handler: CallableReference,
+    ordinal: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 struct SymbolReferences {
     values: HashSet<String>,
@@ -233,6 +289,12 @@ struct RouterRegistration {
     view: ViewReference,
 }
 
+struct FunctionDefinition<'a> {
+    name: &'a str,
+    body: &'a ast::Suite,
+    decorators: &'a [Expr],
+}
+
 #[derive(Debug, Default)]
 struct DjangoProjectIndex {
     classes: Vec<ClassSymbol>,
@@ -241,8 +303,13 @@ struct DjangoProjectIndex {
     classes_by_app_and_name: HashMap<(String, String), usize>,
     model_class_indices: HashSet<usize>,
     data_layers_by_class_index: HashMap<usize, DataLayer>,
+    functions: Vec<FunctionSymbol>,
+    functions_by_python_name: HashMap<String, usize>,
     views: Vec<ViewSymbol>,
     views_by_python_name: HashMap<String, usize>,
+    tasks: Vec<TaskSymbol>,
+    tasks_by_python_name: HashMap<String, usize>,
+    signal_receivers: Vec<SignalReceiver>,
     raw_routes: Vec<RawRoutePattern>,
     raw_routes_by_python_module: HashMap<String, Vec<usize>>,
     router_registrations_by_owner: HashMap<(String, String), Vec<RouterRegistration>>,
@@ -281,6 +348,12 @@ impl DjangoProjectIndex {
                 &module.ast,
             );
             collect_settings_in_suite(&mut index, source_file, &import_index, &module.ast);
+            collect_hidden_execution_in_suite(
+                &mut index,
+                &python_module,
+                &import_index,
+                &module.ast,
+            );
         }
 
         index
@@ -327,6 +400,30 @@ impl DjangoProjectIndex {
         self.views_by_python_name
             .insert(view.python_qualified_name.clone(), view_index);
         self.views.push(view);
+    }
+
+    fn add_function(&mut self, function: FunctionSymbol) -> usize {
+        let function_index = self.functions.len();
+
+        self.functions_by_python_name
+            .insert(function.python_qualified_name.clone(), function_index);
+        self.functions.push(function);
+
+        function_index
+    }
+
+    fn add_task(&mut self, function_index: usize) {
+        let task_index = self.tasks.len();
+        let function = &self.functions[function_index];
+
+        self.tasks_by_python_name
+            .insert(function.python_qualified_name.clone(), task_index);
+        self.tasks.push(TaskSymbol { function_index });
+    }
+
+    fn add_signal_receiver(&mut self, mut receiver: SignalReceiver) {
+        receiver.ordinal = self.signal_receivers.len();
+        self.signal_receivers.push(receiver);
     }
 
     fn add_raw_route(
@@ -712,6 +809,8 @@ impl DjangoProjectIndex {
         }
 
         let data_layer_nodes = self.emit_data_layer_graph(graph, &model_nodes);
+        let task_nodes = self.emit_task_graph(graph, &model_nodes);
+        self.emit_signal_graph(graph, &model_nodes, &task_nodes);
         let middleware_nodes = self.emit_middleware_graph(graph);
 
         self.emit_route_graph(graph, &data_layer_nodes, &model_nodes, &middleware_nodes);
@@ -826,6 +925,155 @@ impl DjangoProjectIndex {
         }
 
         data_layer_nodes
+    }
+
+    fn emit_task_graph(
+        &self,
+        graph: &mut GraphBuilder,
+        model_nodes: &HashMap<usize, NodeIndex>,
+    ) -> HashMap<usize, NodeIndex> {
+        let mut task_nodes = HashMap::new();
+
+        for (task_index, task) in self.tasks.iter().enumerate() {
+            let function = &self.functions[task.function_index];
+            let node = graph.add_node(
+                NodeKey::new(NodeType::Task, function.python_qualified_name.clone()),
+                function.qualified_name.clone(),
+                Some(function.module_path.clone()),
+            );
+
+            if let Some(source_file) = function.source_file {
+                graph.add_edge(source_file, node, EdgeType::Contains);
+            }
+
+            task_nodes.insert(task_index, node);
+        }
+
+        for (task_index, task) in self.tasks.iter().enumerate() {
+            let function = &self.functions[task.function_index];
+            let task_node = task_nodes[&task_index];
+
+            self.emit_executable_reference_edges(
+                graph,
+                task_node,
+                &function.python_module,
+                &function.references,
+                model_nodes,
+                &task_nodes,
+            );
+        }
+
+        task_nodes
+    }
+
+    fn emit_signal_graph(
+        &self,
+        graph: &mut GraphBuilder,
+        model_nodes: &HashMap<usize, NodeIndex>,
+        task_nodes: &HashMap<usize, NodeIndex>,
+    ) {
+        let mut handler_nodes = HashMap::new();
+        let mut signal_receivers = self.signal_receivers.iter().collect::<Vec<_>>();
+
+        signal_receivers.sort_by_key(|receiver| receiver.ordinal);
+
+        for receiver in signal_receivers {
+            let signal = graph.add_node(
+                NodeKey::new(NodeType::Signal, receiver.signal.value.clone()),
+                class_name(&receiver.signal.value).to_owned(),
+                None,
+            );
+
+            if let Some(sender) = &receiver.sender
+                && let Some(model_index) = self.resolve_model_reference_in_module(
+                    &receiver.python_module,
+                    &sender.value,
+                    None,
+                )
+                && let Some(&model_node) = model_nodes.get(&model_index)
+            {
+                graph.add_edge(model_node, signal, EdgeType::Triggers);
+            }
+
+            let handler =
+                self.handler_node_for_reference(graph, &receiver.handler, &mut handler_nodes);
+
+            graph.add_edge(signal, handler, EdgeType::Triggers);
+
+            if let Some(function_index) = self.resolve_function_reference(&receiver.handler.value) {
+                let function = &self.functions[function_index];
+
+                self.emit_executable_reference_edges(
+                    graph,
+                    handler,
+                    &function.python_module,
+                    &function.references,
+                    model_nodes,
+                    task_nodes,
+                );
+            }
+        }
+    }
+
+    fn handler_node_for_reference(
+        &self,
+        graph: &mut GraphBuilder,
+        reference: &CallableReference,
+        handler_nodes: &mut HashMap<String, NodeIndex>,
+    ) -> NodeIndex {
+        if let Some(handler) = handler_nodes.get(&reference.value) {
+            return *handler;
+        }
+
+        let node = if let Some(function_index) = self.resolve_function_reference(&reference.value) {
+            let function = &self.functions[function_index];
+            let node = graph.add_node(
+                function.handler_node_key(),
+                function.qualified_name.clone(),
+                Some(function.module_path.clone()),
+            );
+
+            if let Some(source_file) = function.source_file {
+                graph.add_edge(source_file, node, EdgeType::Contains);
+            }
+
+            node
+        } else {
+            graph.add_node(
+                NodeKey::new(NodeType::Handler, reference.value.clone()),
+                class_name(&reference.value).to_owned(),
+                None,
+            )
+        };
+
+        handler_nodes.insert(reference.value.clone(), node);
+        node
+    }
+
+    fn emit_executable_reference_edges(
+        &self,
+        graph: &mut GraphBuilder,
+        source_node: NodeIndex,
+        python_module: &str,
+        references: &SymbolReferences,
+        model_nodes: &HashMap<usize, NodeIndex>,
+        task_nodes: &HashMap<usize, NodeIndex>,
+    ) {
+        for reference in references.sorted_values() {
+            if let Some(model_index) =
+                self.resolve_model_reference_in_module(python_module, reference, None)
+                && let Some(&model_node) = model_nodes.get(&model_index)
+            {
+                graph.add_edge(source_node, model_node, EdgeType::Queries);
+            }
+
+            if let Some(task_index) = self.resolve_task_reference(reference)
+                && let Some(&task_node) = task_nodes.get(&task_index)
+                && task_node != source_node
+            {
+                graph.add_edge(source_node, task_node, EdgeType::Triggers);
+            }
+        }
     }
 
     fn emit_configured_app_graph(
@@ -1001,6 +1249,26 @@ impl DjangoProjectIndex {
             .filter(|class_index| self.data_layers_by_class_index.contains_key(class_index))
     }
 
+    fn resolve_function_reference(&self, reference: &str) -> Option<usize> {
+        for candidate in reference_prefixes(reference) {
+            if let Some(function_index) = self.functions_by_python_name.get(candidate) {
+                return Some(*function_index);
+            }
+        }
+
+        None
+    }
+
+    fn resolve_task_reference(&self, reference: &str) -> Option<usize> {
+        for candidate in reference_prefixes(reference) {
+            if let Some(task_index) = self.tasks_by_python_name.get(candidate) {
+                return Some(*task_index);
+            }
+        }
+
+        None
+    }
+
     fn resolve_model_reference_in_module(
         &self,
         python_module: &str,
@@ -1162,14 +1430,17 @@ fn collect_function(
     import_index: &ImportIndex,
     function_def: &StmtFunctionDef,
 ) {
-    collect_view_function(
+    collect_top_level_function(
         index,
         source_file,
         module_path,
         python_module,
         import_index,
-        function_def.name.as_str(),
-        &function_def.body,
+        FunctionDefinition {
+            name: function_def.name.as_str(),
+            body: &function_def.body,
+            decorators: &function_def.decorator_list,
+        },
     );
 }
 
@@ -1181,34 +1452,62 @@ fn collect_async_function(
     import_index: &ImportIndex,
     function_def: &StmtAsyncFunctionDef,
 ) {
-    collect_view_function(
+    collect_top_level_function(
         index,
         source_file,
         module_path,
         python_module,
         import_index,
-        function_def.name.as_str(),
-        &function_def.body,
+        FunctionDefinition {
+            name: function_def.name.as_str(),
+            body: &function_def.body,
+            decorators: &function_def.decorator_list,
+        },
     );
 }
 
-fn collect_view_function(
+fn collect_top_level_function(
     index: &mut DjangoProjectIndex,
     source_file: Option<NodeIndex>,
     module_path: &str,
     python_module: &str,
     import_index: &ImportIndex,
-    name: &str,
-    body: &ast::Suite,
+    definition: FunctionDefinition<'_>,
 ) {
+    let references = collect_symbol_references(definition.body, import_index, python_module);
+    let python_qualified_name = format!("{python_module}.{}", definition.name);
+    let function_index = index.add_function(FunctionSymbol {
+        source_file,
+        module_path: module_path.to_owned(),
+        python_module: python_module.to_owned(),
+        qualified_name: definition.name.to_owned(),
+        python_qualified_name: python_qualified_name.clone(),
+        references: references.clone(),
+    });
+
     index.add_view(ViewSymbol {
         source_file,
         module_path: module_path.to_owned(),
         python_module: python_module.to_owned(),
-        qualified_name: name.to_owned(),
-        python_qualified_name: format!("{python_module}.{name}"),
-        references: collect_symbol_references(body, import_index, python_module),
+        qualified_name: definition.name.to_owned(),
+        python_qualified_name: python_qualified_name.clone(),
+        references,
     });
+
+    for decorator in definition.decorators {
+        if is_task_decorator(decorator, import_index) {
+            index.add_task(function_index);
+        }
+
+        for receiver in signal_receivers_from_decorator(
+            decorator,
+            python_module,
+            &CallableReference::new(python_qualified_name.clone()),
+            import_index,
+        ) {
+            index.add_signal_receiver(receiver);
+        }
+    }
 }
 
 fn collect_routes_in_suite(
@@ -1288,6 +1587,21 @@ fn collect_settings_assignment(settings: &mut DjangoSettingsModule, target: &Exp
             }
         }
         _ => {}
+    }
+}
+
+fn collect_hidden_execution_in_suite(
+    index: &mut DjangoProjectIndex,
+    python_module: &str,
+    import_index: &ImportIndex,
+    suite: &ast::Suite,
+) {
+    for statement in suite {
+        if let Some(receiver) =
+            signal_receiver_from_connect_statement(statement, python_module, import_index)
+        {
+            index.add_signal_receiver(receiver);
+        }
     }
 }
 
@@ -1561,6 +1875,22 @@ fn view_reference_from_expr(
     Some(ViewReference::new(value))
 }
 
+fn callable_reference_from_expr(
+    expr: &Expr,
+    python_module: &str,
+    import_index: &ImportIndex,
+) -> Option<CallableReference> {
+    let dotted_name = expr_dotted_name(expr)?;
+    let resolved_name = import_index.resolve(&dotted_name);
+    let value = if resolved_name == dotted_name && !dotted_name.contains('.') {
+        format!("{python_module}.{dotted_name}")
+    } else {
+        resolved_name
+    };
+
+    Some(CallableReference::new(value))
+}
+
 fn class_based_view_name(call: &ast::ExprCall) -> Option<String> {
     let Expr::Attribute(function) = call.func.as_ref() else {
         return None;
@@ -1571,6 +1901,127 @@ fn class_based_view_name(call: &ast::ExprCall) -> Option<String> {
     } else {
         None
     }
+}
+
+fn signal_receivers_from_decorator(
+    decorator: &Expr,
+    python_module: &str,
+    handler: &CallableReference,
+    import_index: &ImportIndex,
+) -> Vec<SignalReceiver> {
+    let Expr::Call(call) = decorator else {
+        return Vec::new();
+    };
+
+    let Some(function_name) = expr_dotted_name(&call.func) else {
+        return Vec::new();
+    };
+
+    if !is_signal_receiver_decorator(&import_index.resolve(&function_name)) {
+        return Vec::new();
+    }
+
+    let Some(signal_expr) = call
+        .args
+        .first()
+        .or_else(|| keyword_value(&call.keywords, "signal"))
+    else {
+        return Vec::new();
+    };
+    let sender = keyword_value(&call.keywords, "sender")
+        .and_then(|sender| expr_model_reference(sender, import_index));
+
+    signal_references_from_expr(signal_expr, import_index)
+        .into_iter()
+        .map(|signal| SignalReceiver {
+            python_module: python_module.to_owned(),
+            signal,
+            sender: sender.clone(),
+            handler: handler.clone(),
+            ordinal: 0,
+        })
+        .collect()
+}
+
+fn signal_receiver_from_connect_statement(
+    statement: &Stmt,
+    python_module: &str,
+    import_index: &ImportIndex,
+) -> Option<SignalReceiver> {
+    let Stmt::Expr(statement) = statement else {
+        return None;
+    };
+    let Expr::Call(call) = statement.value.as_ref() else {
+        return None;
+    };
+    let Expr::Attribute(function) = call.func.as_ref() else {
+        return None;
+    };
+
+    if function.attr.as_str() != "connect" {
+        return None;
+    }
+
+    let signal = signal_reference_from_expr(&function.value, import_index)?;
+    let handler_expr = call
+        .args
+        .first()
+        .or_else(|| keyword_value(&call.keywords, "receiver"))?;
+    let handler = callable_reference_from_expr(handler_expr, python_module, import_index)?;
+    let sender = keyword_value(&call.keywords, "sender")
+        .and_then(|sender| expr_model_reference(sender, import_index));
+
+    Some(SignalReceiver {
+        python_module: python_module.to_owned(),
+        signal,
+        sender,
+        handler,
+        ordinal: 0,
+    })
+}
+
+fn signal_references_from_expr(expr: &Expr, import_index: &ImportIndex) -> Vec<SignalReference> {
+    match expr {
+        Expr::List(list) => list
+            .elts
+            .iter()
+            .filter_map(|expr| signal_reference_from_expr(expr, import_index))
+            .collect(),
+        Expr::Tuple(tuple) => tuple
+            .elts
+            .iter()
+            .filter_map(|expr| signal_reference_from_expr(expr, import_index))
+            .collect(),
+        _ => signal_reference_from_expr(expr, import_index)
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn signal_reference_from_expr(expr: &Expr, import_index: &ImportIndex) -> Option<SignalReference> {
+    let dotted_name = expr_dotted_name(expr)?;
+
+    Some(SignalReference::new(import_index.resolve(&dotted_name)))
+}
+
+fn is_signal_receiver_decorator(value: &str) -> bool {
+    matches!(value, "django.dispatch.receiver" | "receiver")
+}
+
+fn is_task_decorator(expr: &Expr, import_index: &ImportIndex) -> bool {
+    let function_expr = if let Expr::Call(call) = expr {
+        call.func.as_ref()
+    } else {
+        expr
+    };
+
+    expr_dotted_name(function_expr)
+        .map(|function_name| import_index.resolve(&function_name))
+        .is_some_and(|function_name| is_task_decorator_name(&function_name))
+}
+
+fn is_task_decorator_name(value: &str) -> bool {
+    value == "celery.shared_task" || value == "shared_task" || value.ends_with(".task")
 }
 
 fn is_urlpatterns_target(expr: &Expr) -> bool {
@@ -3385,6 +3836,117 @@ def unused_view(request):
             edge.source == "middleware:project.middleware.TenantMiddleware"
                 && edge.target == localized_url_id
                 && edge.edge_type == EdgeType::Intercepts
+        }));
+    }
+
+    #[test]
+    fn maps_signals_handlers_and_celery_tasks() {
+        let project = TempProject::new("django-hidden-execution");
+        let models = project.write(
+            "shop/models.py",
+            r#"
+from django.db import models
+
+class Customer(models.Model):
+    pass
+
+class AuditLog(models.Model):
+    pass
+"#,
+        );
+        let celery_app = project.write(
+            "project/celery.py",
+            r#"
+class App:
+    def task(self, fn=None, **kwargs):
+        return fn
+
+app = App()
+"#,
+        );
+        let tasks = project.write(
+            "shop/tasks.py",
+            r#"
+from celery import shared_task
+from project.celery import app
+from .models import AuditLog
+
+@shared_task
+def rebuild_customer_cache(customer_id):
+    AuditLog.objects.create()
+
+@app.task()
+def sync_customer(customer_id):
+    AuditLog.objects.create()
+"#,
+        );
+        let signals = project.write(
+            "shop/signals.py",
+            r#"
+from django.db.models.signals import post_delete, post_save
+from django.dispatch import receiver
+from .models import AuditLog, Customer
+from .tasks import rebuild_customer_cache, sync_customer
+
+@receiver(post_save, sender=Customer)
+def create_audit_log(sender, instance, **kwargs):
+    AuditLog.objects.create()
+    rebuild_customer_cache.delay(instance.id)
+
+def delete_audit_log(sender, instance, **kwargs):
+    AuditLog.objects.create()
+    sync_customer.apply_async(args=[instance.id])
+
+post_delete.connect(delete_audit_log, sender=Customer)
+"#,
+        );
+        let files = vec![models, celery_app, tasks, signals];
+        let report = parse_python_files(&files);
+
+        assert!(!report.has_diagnostics());
+
+        let graph = analyze_python_project(&project.path, &files, &report.modules);
+
+        assert_eq!(graph.node_count_by_type(NodeType::Model), 2);
+        assert_eq!(graph.node_count_by_type(NodeType::Signal), 2);
+        assert_eq!(graph.node_count_by_type(NodeType::Handler), 2);
+        assert_eq!(graph.node_count_by_type(NodeType::Task), 2);
+        assert_eq!(graph.edge_count_by_type(EdgeType::Triggers), 6);
+        assert_eq!(graph.edge_count_by_type(EdgeType::Queries), 4);
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "model:shop/models.py:Customer"
+                && edge.target == "signal:django.db.models.signals.post_save"
+                && edge.edge_type == EdgeType::Triggers
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "signal:django.db.models.signals.post_save"
+                && edge.target == "handler:shop.signals.create_audit_log"
+                && edge.edge_type == EdgeType::Triggers
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "handler:shop.signals.create_audit_log"
+                && edge.target == "task:shop.tasks.rebuild_customer_cache"
+                && edge.edge_type == EdgeType::Triggers
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "signal:django.db.models.signals.post_delete"
+                && edge.target == "handler:shop.signals.delete_audit_log"
+                && edge.edge_type == EdgeType::Triggers
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "handler:shop.signals.delete_audit_log"
+                && edge.target == "task:shop.tasks.sync_customer"
+                && edge.edge_type == EdgeType::Triggers
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "task:shop.tasks.rebuild_customer_cache"
+                && edge.target == "model:shop/models.py:AuditLog"
+                && edge.edge_type == EdgeType::Queries
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "task:shop.tasks.sync_customer"
+                && edge.target == "model:shop/models.py:AuditLog"
+                && edge.edge_type == EdgeType::Queries
         }));
     }
 
