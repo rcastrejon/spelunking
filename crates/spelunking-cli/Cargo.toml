@@ -8,4 +8,5 @@ name = "spelunking"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 spelunking-core.workspace = true
