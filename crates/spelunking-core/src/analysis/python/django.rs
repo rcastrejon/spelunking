@@ -1,9 +1,12 @@
+use super::imports::{ImportIndex, expr_dotted_name, first_segment, python_module_path};
 use crate::{
     analysis::{AnalysisContext, Analyzer, SourceLanguage},
     graph::{EdgeType, GraphBuilder, NodeKey, NodeType, relative_path_identifier},
 };
 use petgraph::graph::NodeIndex;
-use rustpython_parser::ast::{self, Constant, Expr, Stmt, StmtClassDef};
+use rustpython_parser::ast::{
+    self, Constant, Expr, Stmt, StmtAsyncFunctionDef, StmtClassDef, StmtFunctionDef,
+};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -23,6 +26,7 @@ impl Analyzer for DjangoModelAnalyzer {
     fn analyze(&self, context: &AnalysisContext<'_>, graph: &mut GraphBuilder) {
         let mut index = DjangoProjectIndex::from_context(context);
         index.resolve_model_classes();
+        index.resolve_routes();
         index.emit_graph(graph);
     }
 }
@@ -46,6 +50,20 @@ impl ClassSymbol {
 
     fn model_node_key(&self) -> NodeKey {
         NodeKey::new(NodeType::Model, self.model_identifier())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ViewSymbol {
+    source_file: Option<NodeIndex>,
+    module_path: String,
+    qualified_name: String,
+    python_qualified_name: String,
+}
+
+impl ViewSymbol {
+    fn node_key(&self) -> NodeKey {
+        NodeKey::new(NodeType::View, self.python_qualified_name.clone())
     }
 }
 
@@ -84,6 +102,59 @@ struct ModelRelationship {
     target: ModelReference,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ViewReference {
+    value: String,
+}
+
+impl ViewReference {
+    fn new(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RawRoutePattern {
+    source_file: Option<NodeIndex>,
+    source_path: String,
+    python_module: String,
+    route: String,
+    target: RawRouteTarget,
+    ordinal: usize,
+}
+
+#[derive(Debug, Clone)]
+enum RawRouteTarget {
+    View(ViewReference),
+    Include(IncludeReference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum IncludeReference {
+    Module(String),
+    Router {
+        python_module: String,
+        variable: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedRoutePattern {
+    source_file: Option<NodeIndex>,
+    source_path: String,
+    route: String,
+    view: ViewReference,
+    ordinal: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RouterRegistration {
+    route: String,
+    view: ViewReference,
+}
+
 #[derive(Debug, Default)]
 struct DjangoProjectIndex {
     classes: Vec<ClassSymbol>,
@@ -91,6 +162,12 @@ struct DjangoProjectIndex {
     classes_by_module_local_name: HashMap<(String, String), usize>,
     classes_by_app_and_name: HashMap<(String, String), usize>,
     model_class_indices: HashSet<usize>,
+    views: Vec<ViewSymbol>,
+    views_by_python_name: HashMap<String, usize>,
+    raw_routes: Vec<RawRoutePattern>,
+    raw_routes_by_python_module: HashMap<String, Vec<usize>>,
+    router_registrations_by_owner: HashMap<(String, String), Vec<RouterRegistration>>,
+    routes: Vec<ResolvedRoutePattern>,
 }
 
 impl DjangoProjectIndex {
@@ -103,7 +180,7 @@ impl DjangoProjectIndex {
             let import_index = ImportIndex::from_suite(&module.ast, &python_module);
             let source_file = context.source_file_index(&module.path);
 
-            collect_classes_in_suite(
+            collect_definitions_in_suite(
                 &mut index,
                 source_file,
                 &module_path,
@@ -111,6 +188,14 @@ impl DjangoProjectIndex {
                 &import_index,
                 &module.ast,
                 &mut Vec::new(),
+            );
+            collect_routes_in_suite(
+                &mut index,
+                source_file,
+                &module_path,
+                &python_module,
+                &import_index,
+                &module.ast,
             );
         }
 
@@ -147,6 +232,50 @@ impl DjangoProjectIndex {
         self.classes.push(class);
     }
 
+    fn add_view(&mut self, view: ViewSymbol) {
+        let view_index = self.views.len();
+
+        self.views_by_python_name
+            .insert(view.python_qualified_name.clone(), view_index);
+        self.views.push(view);
+    }
+
+    fn add_raw_route(
+        &mut self,
+        source_file: Option<NodeIndex>,
+        source_path: &str,
+        python_module: &str,
+        route: String,
+        target: RawRouteTarget,
+    ) {
+        let route_index = self.raw_routes.len();
+
+        self.raw_routes.push(RawRoutePattern {
+            source_file,
+            source_path: source_path.to_owned(),
+            python_module: python_module.to_owned(),
+            route,
+            target,
+            ordinal: route_index,
+        });
+        self.raw_routes_by_python_module
+            .entry(python_module.to_owned())
+            .or_default()
+            .push(route_index);
+    }
+
+    fn add_router_registration(
+        &mut self,
+        python_module: &str,
+        variable: &str,
+        registration: RouterRegistration,
+    ) {
+        self.router_registrations_by_owner
+            .entry((python_module.to_owned(), variable.to_owned()))
+            .or_default()
+            .push(registration);
+    }
+
     fn resolve_model_classes(&mut self) {
         let mut resolution_state = vec![ResolutionState::Unvisited; self.classes.len()];
 
@@ -175,6 +304,95 @@ impl DjangoProjectIndex {
 
         state[class_index] = ResolutionState::Resolved(is_model);
         is_model
+    }
+
+    fn resolve_routes(&mut self) {
+        self.routes.clear();
+
+        let included_modules = self
+            .raw_routes
+            .iter()
+            .filter_map(|route| match &route.target {
+                RawRouteTarget::Include(IncludeReference::Module(module)) => Some(module.clone()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+
+        let root_route_indices = self
+            .raw_routes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, route)| {
+                (!included_modules.contains(&route.python_module)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        let mut routes = Vec::new();
+
+        for route_index in root_route_indices {
+            self.expand_route(route_index, "", &mut Vec::new(), &mut routes);
+        }
+
+        self.routes = routes;
+    }
+
+    fn expand_route(
+        &self,
+        route_index: usize,
+        prefix: &str,
+        module_stack: &mut Vec<String>,
+        routes: &mut Vec<ResolvedRoutePattern>,
+    ) {
+        let raw_route = &self.raw_routes[route_index];
+        let route = combine_route_patterns(prefix, &raw_route.route);
+
+        match &raw_route.target {
+            RawRouteTarget::View(view) => routes.push(ResolvedRoutePattern {
+                source_file: raw_route.source_file,
+                source_path: raw_route.source_path.clone(),
+                route,
+                view: view.clone(),
+                ordinal: raw_route.ordinal,
+            }),
+            RawRouteTarget::Include(IncludeReference::Module(module)) => {
+                if module_stack.contains(module) {
+                    return;
+                }
+
+                let Some(included_routes) = self.raw_routes_by_python_module.get(module) else {
+                    return;
+                };
+
+                module_stack.push(module.clone());
+
+                for &included_route_index in included_routes {
+                    self.expand_route(included_route_index, &route, module_stack, routes);
+                }
+
+                module_stack.pop();
+            }
+            RawRouteTarget::Include(IncludeReference::Router {
+                python_module,
+                variable,
+            }) => {
+                let Some(registrations) = self
+                    .router_registrations_by_owner
+                    .get(&(python_module.clone(), variable.clone()))
+                else {
+                    return;
+                };
+
+                for registration in registrations {
+                    routes.push(ResolvedRoutePattern {
+                        source_file: raw_route.source_file,
+                        source_path: raw_route.source_path.clone(),
+                        route: combine_route_patterns(&route, &registration.route),
+                        view: registration.view.clone(),
+                        ordinal: raw_route.ordinal,
+                    });
+                }
+            }
+        }
     }
 
     fn emit_graph(&self, graph: &mut GraphBuilder) {
@@ -228,6 +446,8 @@ impl DjangoProjectIndex {
                 }
             }
         }
+
+        self.emit_route_graph(graph);
     }
 
     fn resolve_model_reference(
@@ -270,6 +490,64 @@ impl DjangoProjectIndex {
 
         None
     }
+
+    fn emit_route_graph(&self, graph: &mut GraphBuilder) {
+        let mut view_nodes = HashMap::new();
+
+        for route in &self.routes {
+            let url = graph.add_node(
+                NodeKey::new(
+                    NodeType::Url,
+                    format!("{}:{}:{}", route.source_path, route.ordinal, route.route),
+                ),
+                route.route.clone(),
+                Some(route.source_path.clone()),
+            );
+
+            if let Some(source_file) = route.source_file {
+                graph.add_edge(source_file, url, EdgeType::Contains);
+            }
+
+            let view = self.view_node_for_reference(graph, &route.view, &mut view_nodes);
+
+            graph.add_edge(url, view, EdgeType::RoutesTo);
+        }
+    }
+
+    fn view_node_for_reference(
+        &self,
+        graph: &mut GraphBuilder,
+        reference: &ViewReference,
+        view_nodes: &mut HashMap<String, NodeIndex>,
+    ) -> NodeIndex {
+        if let Some(view) = view_nodes.get(&reference.value) {
+            return *view;
+        }
+
+        let node = if let Some(view_index) = self.views_by_python_name.get(&reference.value) {
+            let view = &self.views[*view_index];
+            let node = graph.add_node(
+                view.node_key(),
+                view.qualified_name.clone(),
+                Some(view.module_path.clone()),
+            );
+
+            if let Some(source_file) = view.source_file {
+                graph.add_edge(source_file, node, EdgeType::Contains);
+            }
+
+            node
+        } else {
+            graph.add_node(
+                NodeKey::new(NodeType::View, reference.value.clone()),
+                class_name(&reference.value).to_owned(),
+                None,
+            )
+        };
+
+        view_nodes.insert(reference.value.clone(), node);
+        node
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,7 +557,7 @@ enum ResolutionState {
     Resolved(bool),
 }
 
-fn collect_classes_in_suite(
+fn collect_definitions_in_suite(
     index: &mut DjangoProjectIndex,
     source_file: Option<NodeIndex>,
     module_path: &str,
@@ -289,8 +567,8 @@ fn collect_classes_in_suite(
     class_stack: &mut Vec<String>,
 ) {
     for statement in suite {
-        if let Stmt::ClassDef(class_def) = statement {
-            collect_class(
+        match statement {
+            Stmt::ClassDef(class_def) => collect_class(
                 index,
                 source_file,
                 module_path,
@@ -298,7 +576,14 @@ fn collect_classes_in_suite(
                 import_index,
                 class_def,
                 class_stack,
-            );
+            ),
+            Stmt::FunctionDef(function_def) if class_stack.is_empty() => {
+                collect_function(index, source_file, module_path, python_module, function_def)
+            }
+            Stmt::AsyncFunctionDef(function_def) if class_stack.is_empty() => {
+                collect_async_function(index, source_file, module_path, python_module, function_def)
+            }
+            _ => {}
         }
     }
 }
@@ -327,14 +612,21 @@ fn collect_class(
         source_file,
         module_path: module_path.to_owned(),
         python_module: python_module.to_owned(),
-        qualified_name,
-        python_qualified_name,
+        qualified_name: qualified_name.clone(),
+        python_qualified_name: python_qualified_name.clone(),
         bases,
         relationships,
         app: infer_django_app(module_path),
     });
 
-    collect_classes_in_suite(
+    index.add_view(ViewSymbol {
+        source_file,
+        module_path: module_path.to_owned(),
+        qualified_name: qualified_name.clone(),
+        python_qualified_name,
+    });
+
+    collect_definitions_in_suite(
         index,
         source_file,
         module_path,
@@ -345,6 +637,398 @@ fn collect_class(
     );
 
     class_stack.pop();
+}
+
+fn collect_function(
+    index: &mut DjangoProjectIndex,
+    source_file: Option<NodeIndex>,
+    module_path: &str,
+    python_module: &str,
+    function_def: &StmtFunctionDef,
+) {
+    collect_view_function(
+        index,
+        source_file,
+        module_path,
+        python_module,
+        function_def.name.as_str(),
+    );
+}
+
+fn collect_async_function(
+    index: &mut DjangoProjectIndex,
+    source_file: Option<NodeIndex>,
+    module_path: &str,
+    python_module: &str,
+    function_def: &StmtAsyncFunctionDef,
+) {
+    collect_view_function(
+        index,
+        source_file,
+        module_path,
+        python_module,
+        function_def.name.as_str(),
+    );
+}
+
+fn collect_view_function(
+    index: &mut DjangoProjectIndex,
+    source_file: Option<NodeIndex>,
+    module_path: &str,
+    python_module: &str,
+    name: &str,
+) {
+    index.add_view(ViewSymbol {
+        source_file,
+        module_path: module_path.to_owned(),
+        qualified_name: name.to_owned(),
+        python_qualified_name: format!("{python_module}.{name}"),
+    });
+}
+
+fn collect_routes_in_suite(
+    index: &mut DjangoProjectIndex,
+    source_file: Option<NodeIndex>,
+    module_path: &str,
+    python_module: &str,
+    import_index: &ImportIndex,
+    suite: &ast::Suite,
+) {
+    for statement in suite {
+        if let Some((variable, registration)) =
+            router_registration_from_statement(statement, python_module, import_index)
+        {
+            index.add_router_registration(python_module, &variable, registration);
+        }
+
+        collect_raw_routes_from_statement(
+            index,
+            source_file,
+            module_path,
+            python_module,
+            import_index,
+            statement,
+        );
+    }
+}
+
+fn router_registration_from_statement(
+    statement: &Stmt,
+    python_module: &str,
+    import_index: &ImportIndex,
+) -> Option<(String, RouterRegistration)> {
+    let Stmt::Expr(statement) = statement else {
+        return None;
+    };
+    let Expr::Call(call) = statement.value.as_ref() else {
+        return None;
+    };
+    let Expr::Attribute(function) = call.func.as_ref() else {
+        return None;
+    };
+
+    if function.attr.as_str() != "register" {
+        return None;
+    }
+
+    let variable = expr_dotted_name(&function.value)?;
+
+    if variable.contains('.') {
+        return None;
+    }
+
+    let route = call
+        .args
+        .first()
+        .or_else(|| keyword_value(&call.keywords, "prefix"))
+        .and_then(string_constant)?;
+    let view_expr = call
+        .args
+        .get(1)
+        .or_else(|| keyword_value(&call.keywords, "viewset"))?;
+    let view = view_reference_from_expr(view_expr, python_module, import_index)?;
+
+    Some((
+        variable,
+        RouterRegistration {
+            route: normalize_router_route(&route),
+            view,
+        },
+    ))
+}
+
+fn collect_raw_routes_from_statement(
+    index: &mut DjangoProjectIndex,
+    source_file: Option<NodeIndex>,
+    module_path: &str,
+    python_module: &str,
+    import_index: &ImportIndex,
+    statement: &Stmt,
+) {
+    match statement {
+        Stmt::Assign(assign) if assign.targets.iter().any(is_urlpatterns_target) => {
+            collect_raw_routes_from_expr(
+                index,
+                source_file,
+                module_path,
+                python_module,
+                import_index,
+                &assign.value,
+            );
+        }
+        Stmt::AugAssign(assign) if is_urlpatterns_target(&assign.target) => {
+            collect_raw_routes_from_expr(
+                index,
+                source_file,
+                module_path,
+                python_module,
+                import_index,
+                &assign.value,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn collect_raw_routes_from_expr(
+    index: &mut DjangoProjectIndex,
+    source_file: Option<NodeIndex>,
+    module_path: &str,
+    python_module: &str,
+    import_index: &ImportIndex,
+    expr: &Expr,
+) {
+    match expr {
+        Expr::List(list) => {
+            for item in &list.elts {
+                collect_raw_routes_from_expr(
+                    index,
+                    source_file,
+                    module_path,
+                    python_module,
+                    import_index,
+                    item,
+                );
+            }
+        }
+        Expr::Tuple(tuple) => {
+            for item in &tuple.elts {
+                collect_raw_routes_from_expr(
+                    index,
+                    source_file,
+                    module_path,
+                    python_module,
+                    import_index,
+                    item,
+                );
+            }
+        }
+        Expr::Call(call) => {
+            if let Some((route, target)) = route_call(call, python_module, import_index) {
+                index.add_raw_route(source_file, module_path, python_module, route, target);
+            }
+        }
+        Expr::Attribute(_) => {
+            if let Some(include) = include_reference_from_expr(expr, python_module, import_index) {
+                index.add_raw_route(
+                    source_file,
+                    module_path,
+                    python_module,
+                    String::new(),
+                    RawRouteTarget::Include(include),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn route_call(
+    call: &ast::ExprCall,
+    python_module: &str,
+    import_index: &ImportIndex,
+) -> Option<(String, RawRouteTarget)> {
+    let function_name = expr_dotted_name(&call.func)?;
+    let function_name = import_index.resolve(&function_name);
+
+    if !is_django_route_function(&function_name) {
+        return None;
+    }
+
+    let route = call
+        .args
+        .first()
+        .or_else(|| keyword_value(&call.keywords, "route"))
+        .and_then(string_constant)?;
+    let target_expr = call
+        .args
+        .get(1)
+        .or_else(|| keyword_value(&call.keywords, "view"))?;
+    let target = route_target_from_expr(target_expr, python_module, import_index)?;
+
+    Some((route, target))
+}
+
+fn route_target_from_expr(
+    expr: &Expr,
+    python_module: &str,
+    import_index: &ImportIndex,
+) -> Option<RawRouteTarget> {
+    if let Expr::Call(call) = expr
+        && let Some(include) = include_reference_from_call(call, python_module, import_index)
+    {
+        return Some(RawRouteTarget::Include(include));
+    }
+
+    if matches!(expr, Expr::Attribute(attribute) if attribute.attr.as_str() == "urls")
+        && let Some(include) = include_reference_from_expr(expr, python_module, import_index)
+    {
+        return Some(RawRouteTarget::Include(include));
+    }
+
+    view_reference_from_expr(expr, python_module, import_index).map(RawRouteTarget::View)
+}
+
+fn include_reference_from_call(
+    call: &ast::ExprCall,
+    python_module: &str,
+    import_index: &ImportIndex,
+) -> Option<IncludeReference> {
+    let function_name = expr_dotted_name(&call.func)?;
+    let function_name = import_index.resolve(&function_name);
+
+    if !is_django_include_function(&function_name) {
+        return None;
+    }
+
+    let target_expr = call
+        .args
+        .first()
+        .or_else(|| keyword_value(&call.keywords, "module"))?;
+
+    include_reference_from_expr(target_expr, python_module, import_index)
+}
+
+fn include_reference_from_expr(
+    expr: &Expr,
+    python_module: &str,
+    import_index: &ImportIndex,
+) -> Option<IncludeReference> {
+    match expr {
+        Expr::Constant(_) => string_constant(expr).map(IncludeReference::Module),
+        Expr::Tuple(tuple) => tuple
+            .elts
+            .first()
+            .and_then(|expr| include_reference_from_expr(expr, python_module, import_index)),
+        Expr::Attribute(attribute) if attribute.attr.as_str() == "urls" => {
+            let full_name = expr_dotted_name(expr)?;
+            let base_name = expr_dotted_name(&attribute.value)?;
+            let first_segment = first_segment(&base_name);
+
+            if !base_name.contains('.') && !import_index.has_alias(first_segment) {
+                Some(IncludeReference::Router {
+                    python_module: python_module.to_owned(),
+                    variable: base_name,
+                })
+            } else {
+                Some(IncludeReference::Module(import_index.resolve(&full_name)))
+            }
+        }
+        _ => {
+            let dotted_name = expr_dotted_name(expr)?;
+            let resolved_name = import_index.resolve(&dotted_name);
+
+            (resolved_name != dotted_name).then_some(IncludeReference::Module(resolved_name))
+        }
+    }
+}
+
+fn view_reference_from_expr(
+    expr: &Expr,
+    python_module: &str,
+    import_index: &ImportIndex,
+) -> Option<ViewReference> {
+    let dotted_name = if let Expr::Call(call) = expr {
+        class_based_view_name(call).or_else(|| expr_dotted_name(expr))?
+    } else {
+        expr_dotted_name(expr)?
+    };
+    let resolved_name = import_index.resolve(&dotted_name);
+    let value = if resolved_name == dotted_name && !dotted_name.contains('.') {
+        format!("{python_module}.{dotted_name}")
+    } else {
+        resolved_name
+    };
+
+    Some(ViewReference::new(value))
+}
+
+fn class_based_view_name(call: &ast::ExprCall) -> Option<String> {
+    let Expr::Attribute(function) = call.func.as_ref() else {
+        return None;
+    };
+
+    if function.attr.as_str() == "as_view" {
+        expr_dotted_name(&function.value)
+    } else {
+        None
+    }
+}
+
+fn is_urlpatterns_target(expr: &Expr) -> bool {
+    matches!(expr, Expr::Name(name) if name.id.as_str() == "urlpatterns")
+}
+
+fn is_django_route_function(value: &str) -> bool {
+    matches!(
+        value,
+        "django.urls.path"
+            | "django.urls.re_path"
+            | "django.conf.urls.url"
+            | "path"
+            | "re_path"
+            | "url"
+    )
+}
+
+fn is_django_include_function(value: &str) -> bool {
+    matches!(value, "django.urls.include" | "include")
+}
+
+fn keyword_value<'a>(keywords: &'a [ast::Keyword], name: &str) -> Option<&'a Expr> {
+    keywords.iter().find_map(|keyword| {
+        keyword
+            .arg
+            .as_ref()
+            .is_some_and(|arg| arg.as_str() == name)
+            .then_some(&keyword.value)
+    })
+}
+
+fn string_constant(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Constant(constant) => match &constant.value {
+            Constant::Str(value) => Some(value.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn normalize_router_route(route: &str) -> String {
+    if route.is_empty() || route.ends_with('/') {
+        route.to_owned()
+    } else {
+        format!("{route}/")
+    }
+}
+
+fn combine_route_patterns(prefix: &str, route: &str) -> String {
+    match (prefix.is_empty(), route.is_empty()) {
+        (true, _) => route.to_owned(),
+        (_, true) => prefix.to_owned(),
+        _ => format!("{prefix}{route}"),
+    }
 }
 
 fn collect_relationships(suite: &ast::Suite, import_index: &ImportIndex) -> Vec<ModelRelationship> {
@@ -419,135 +1103,6 @@ fn expr_model_reference(expr: &Expr, import_index: &ImportIndex) -> Option<Model
     }
 }
 
-fn expr_dotted_name(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Name(name) => Some(name.id.to_string()),
-        Expr::Attribute(attribute) => {
-            let parent = expr_dotted_name(&attribute.value)?;
-
-            Some(format!("{parent}.{}", attribute.attr))
-        }
-        _ => None,
-    }
-}
-
-#[derive(Debug, Default)]
-struct ImportIndex {
-    aliases: HashMap<String, String>,
-}
-
-impl ImportIndex {
-    fn from_suite(suite: &ast::Suite, python_module: &str) -> Self {
-        let mut index = Self::default();
-
-        for statement in suite {
-            match statement {
-                Stmt::Import(import) => index.add_imports(&import.names),
-                Stmt::ImportFrom(import_from) => {
-                    let module = import_from_module(
-                        python_module,
-                        import_from.level,
-                        import_from.module.as_ref(),
-                    );
-
-                    index.add_import_from(module.as_deref(), &import_from.names);
-                }
-                _ => {}
-            }
-        }
-
-        index
-    }
-
-    fn add_imports(&mut self, aliases: &[ast::Alias]) {
-        for alias in aliases {
-            let imported_name = alias.name.to_string();
-            let (local_name, resolved_name) = if let Some(asname) = alias.asname.as_ref() {
-                (asname.to_string(), imported_name)
-            } else {
-                let local_name = first_segment(&imported_name).to_owned();
-
-                (local_name.clone(), local_name)
-            };
-
-            self.aliases.insert(local_name, resolved_name);
-        }
-    }
-
-    fn add_import_from(&mut self, module: Option<&str>, aliases: &[ast::Alias]) {
-        let Some(module) = module else {
-            return;
-        };
-
-        for alias in aliases {
-            let imported_name = alias.name.to_string();
-            let local_name = alias
-                .asname
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| imported_name.clone());
-            let fully_qualified_name = format!("{module}.{imported_name}");
-
-            self.aliases.insert(local_name, fully_qualified_name);
-        }
-    }
-
-    fn resolve(&self, dotted_name: &str) -> String {
-        let Some((head, tail)) = dotted_name.split_once('.') else {
-            return self
-                .aliases
-                .get(dotted_name)
-                .cloned()
-                .unwrap_or_else(|| dotted_name.to_owned());
-        };
-
-        if let Some(resolved_head) = self.aliases.get(head) {
-            format!("{resolved_head}.{tail}")
-        } else {
-            dotted_name.to_owned()
-        }
-    }
-}
-
-fn import_from_module(
-    python_module: &str,
-    level: Option<ast::Int>,
-    module: Option<&ast::Identifier>,
-) -> Option<String> {
-    let level = level.map_or(0, |level| level.to_usize());
-
-    if level == 0 {
-        return module.map(ToString::to_string);
-    }
-
-    let mut segments = python_module.split('.').collect::<Vec<_>>();
-
-    segments.pop();
-
-    for _ in 1..level {
-        segments.pop()?;
-    }
-
-    if let Some(module) = module {
-        segments.extend(module.as_str().split('.'));
-    }
-
-    if segments.is_empty() {
-        None
-    } else {
-        Some(segments.join("."))
-    }
-}
-
-fn python_module_path(module_path: &str) -> String {
-    let without_extension = module_path.strip_suffix(".py").unwrap_or(module_path);
-    let without_init = without_extension
-        .strip_suffix("/__init__")
-        .unwrap_or(without_extension);
-
-    without_init.replace('/', ".")
-}
-
 fn infer_django_app(module_path: &str) -> Option<DjangoApp> {
     let path = Path::new(module_path);
     let components = path
@@ -585,17 +1140,10 @@ fn class_name(qualified_name: &str) -> &str {
         .map_or(qualified_name, |(_, name)| name)
 }
 
-fn first_segment(value: &str) -> &str {
-    value.split_once('.').map_or(value, |(first, _)| first)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        analysis::analyze_python_project,
-        parsing::{ParsedPythonModule, parse_python_files},
-    };
+    use crate::{analysis::analyze_python_project, parsing::parse_python_files};
     use std::{
         fs,
         path::PathBuf,
@@ -893,53 +1441,197 @@ class StockItem(django.db.models.Model):
     }
 
     #[test]
-    fn import_index_resolves_common_django_model_imports() {
-        let project = TempProject::new("django-import-index");
-        let models = project.write(
-            "models.py",
+    fn maps_url_patterns_to_function_and_class_views() {
+        let project = TempProject::new("django-url-patterns");
+        let views = project.write(
+            "shop/views.py",
             r#"
-from django.db import models
-from django.db.models import Model as BaseModel
-import django.db.models
-import django.db.models as django_models
+def product_list(request):
+    pass
+
+class ProductDetailView:
+    pass
 "#,
         );
-        let ParsedPythonModule { ast, .. } = parse_python_files(std::slice::from_ref(&models))
-            .modules
-            .remove(0);
-        let index = ImportIndex::from_suite(&ast, "models");
+        let urls = project.write(
+            "shop/urls.py",
+            r#"
+from django.urls import path, re_path
+from . import views
+from .views import ProductDetailView
 
-        assert_eq!(index.resolve("models.Model"), "django.db.models.Model");
-        assert_eq!(index.resolve("BaseModel"), "django.db.models.Model");
-        assert_eq!(
-            index.resolve("django_models.Model"),
-            "django.db.models.Model"
+urlpatterns = [
+    path("products/", views.product_list, name="products"),
+    re_path(r"^products/(?P<pk>\d+)/$", ProductDetailView.as_view(), name="product-detail"),
+]
+"#,
         );
-        assert_eq!(
-            index.resolve("django.db.models.Model"),
-            "django.db.models.Model"
+        let report = parse_python_files(&[views.clone(), urls.clone()]);
+
+        assert!(!report.has_diagnostics());
+
+        let graph = analyze_python_project(&project.path, &[views, urls], &report.modules);
+
+        assert_eq!(graph.node_count_by_type(NodeType::Url), 2);
+        assert_eq!(graph.node_count_by_type(NodeType::View), 2);
+        assert_eq!(graph.edge_count_by_type(EdgeType::RoutesTo), 2);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.id == "view:shop.views.product_list"
+                    && node.path.as_deref() == Some("shop/views.py"))
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.id == "view:shop.views.ProductDetailView"
+                    && node.path.as_deref() == Some("shop/views.py"))
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.node_type == NodeType::Url && node.label == "products/")
+        );
+        assert!(graph.nodes.iter().any(
+            |node| node.node_type == NodeType::Url && node.label == "^products/(?P<pk>\\d+)/$"
+        ));
+    }
+
+    #[test]
+    fn expands_basic_include_patterns() {
+        let project = TempProject::new("django-url-includes");
+        let root_urls = project.write(
+            "project/urls.py",
+            r#"
+from django.urls import include, path
+
+urlpatterns = [
+    path("shop/", include("shop.urls")),
+]
+"#,
+        );
+        let shop_urls = project.write(
+            "shop/urls.py",
+            r#"
+from django.urls import path
+from .views import product_list
+
+urlpatterns = [
+    path("products/", product_list, name="products"),
+]
+"#,
+        );
+        let views = project.write(
+            "shop/views.py",
+            r#"
+def product_list(request):
+    pass
+"#,
+        );
+        let files = vec![root_urls, shop_urls, views];
+        let report = parse_python_files(&files);
+
+        assert!(!report.has_diagnostics());
+
+        let graph = analyze_python_project(&project.path, &files, &report.modules);
+
+        assert_eq!(graph.node_count_by_type(NodeType::Url), 1);
+        assert_eq!(graph.edge_count_by_type(EdgeType::RoutesTo), 1);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.node_type == NodeType::Url && node.label == "shop/products/")
         );
     }
 
     #[test]
-    fn import_index_resolves_relative_imports() {
-        let project = TempProject::new("django-relative-import-index");
-        let models = project.write(
-            "commerce/models/product.py",
+    fn maps_included_drf_router_registrations_to_viewsets() {
+        let project = TempProject::new("django-router-registrations");
+        let urls = project.write(
+            "api/urls.py",
             r#"
-from .base import BaseModel
-from ..shared import TimestampedModel
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
+from .views import ProductViewSet
+
+router = DefaultRouter()
+router.register("products", ProductViewSet, basename="product")
+
+urlpatterns = [
+    path("api/", include(router.urls)),
+]
 "#,
         );
-        let ParsedPythonModule { ast, .. } = parse_python_files(std::slice::from_ref(&models))
-            .modules
-            .remove(0);
-        let index = ImportIndex::from_suite(&ast, "commerce.models.product");
+        let views = project.write(
+            "api/views.py",
+            r#"
+class ProductViewSet:
+    pass
+"#,
+        );
+        let report = parse_python_files(&[urls.clone(), views.clone()]);
 
-        assert_eq!(index.resolve("BaseModel"), "commerce.models.base.BaseModel");
-        assert_eq!(
-            index.resolve("TimestampedModel"),
-            "commerce.shared.TimestampedModel"
+        assert!(!report.has_diagnostics());
+
+        let graph = analyze_python_project(&project.path, &[urls, views], &report.modules);
+
+        assert_eq!(graph.node_count_by_type(NodeType::Url), 1);
+        assert_eq!(graph.node_count_by_type(NodeType::View), 1);
+        assert_eq!(graph.edge_count_by_type(EdgeType::RoutesTo), 1);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.node_type == NodeType::Url && node.label == "api/products/")
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.id == "view:api.views.ProductViewSet"
+                    && node.path.as_deref() == Some("api/views.py"))
+        );
+    }
+
+    #[test]
+    fn maps_direct_drf_router_urlpatterns_to_viewsets() {
+        let project = TempProject::new("django-direct-router-registrations");
+        let urls = project.write(
+            "api/urls.py",
+            r#"
+from rest_framework.routers import DefaultRouter
+from .views import ProductViewSet
+
+router = DefaultRouter()
+router.register("products", ProductViewSet, basename="product")
+
+urlpatterns = router.urls
+"#,
+        );
+        let views = project.write(
+            "api/views.py",
+            r#"
+class ProductViewSet:
+    pass
+"#,
+        );
+        let report = parse_python_files(&[urls.clone(), views.clone()]);
+
+        assert!(!report.has_diagnostics());
+
+        let graph = analyze_python_project(&project.path, &[urls, views], &report.modules);
+
+        assert_eq!(graph.node_count_by_type(NodeType::Url), 1);
+        assert_eq!(graph.edge_count_by_type(EdgeType::RoutesTo), 1);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.node_type == NodeType::Url && node.label == "products/")
         );
     }
 }

@@ -11,7 +11,7 @@ The repository is intentionally minimal at this stage. It only establishes the w
 
 ## Current Usage
 
-The first implementation slice discovers Python files and parses them into RustPython ASTs:
+Spelunking discovers Python files, parses them into RustPython ASTs, and emits a Django architecture graph:
 
 ```sh
 cargo run -p spelunking-cli -- /path/to/django-project
@@ -19,8 +19,17 @@ cargo run -p spelunking-cli -- /path/to/django-project
 
 Use `--list-files` to print every discovered Python file. Use `--fail-on-diagnostics` to return a non-zero exit code when any file cannot be read or parsed.
 
-The CLI can also emit the current graph contract as JSON. At this stage the graph contains source-file, Django app, and Django model nodes, plus containment, inheritance, and direct ORM relationship edges:
+The CLI can also emit the current graph contract as JSON. The graph contains source-file, Django app, model, URL, and view nodes, plus containment, inheritance, direct ORM relationship, and URL routing edges:
 
 ```sh
 cargo run -p spelunking-cli -- /path/to/django-project --format json
 ```
+
+Current Django analysis includes:
+
+- model discovery through direct and inherited Django model bases
+- direct ORM relationships through `ForeignKey`, `OneToOneField`, and `ManyToManyField`
+- URL route discovery from `path(...)`, `re_path(...)`, and legacy `url(...)`
+- function views and class-based views through `.as_view()`
+- basic `include(...)` expansion
+- basic DRF router registrations included through `router.urls`
