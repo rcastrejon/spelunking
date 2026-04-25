@@ -19,7 +19,7 @@ cargo run -p spelunking-cli -- /path/to/django-project
 
 Use `--list-files` to print every discovered Python file. Use `--fail-on-diagnostics` to return a non-zero exit code when any file cannot be read or parsed.
 
-The CLI can also emit the current graph contract as JSON. The graph contains source-file, Django app, model, URL, view, serializer, form, middleware, signal, signal handler, and task nodes, plus containment, inheritance, direct ORM relationship, URL routing, serialization, query, middleware intercept, and trigger edges:
+The CLI can also emit the current graph contract as JSON. The graph contains source-file, Django app, model, URL, view, serializer, form, service, middleware, signal, signal handler, and task nodes, plus containment, call, inheritance, direct ORM relationship, URL routing, serialization, query, middleware intercept, and trigger edges:
 
 ```sh
 cargo run -p spelunking-cli -- /path/to/django-project --format json
@@ -39,6 +39,7 @@ Current Django analysis includes:
 - signal receivers through `@receiver(...)` and `signal.connect(...)`
 - Celery task discovery through `@shared_task` and `@app.task`
 - trigger edges from models to signals, signals to handlers, and handlers to tasks
+- service/helper function calls from views, handlers, tasks, and other services
 - DRF `Serializer` / `ModelSerializer` discovery
 - Django `Form` / `ModelForm` discovery
 - `Meta.model` bindings from serializers/forms to models

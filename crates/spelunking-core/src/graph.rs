@@ -18,6 +18,7 @@ pub enum NodeType {
     Url,
     Serializer,
     Form,
+    Service,
     Handler,
     Signal,
     Task,
@@ -34,6 +35,7 @@ impl NodeType {
             Self::Url => "url",
             Self::Serializer => "serializer",
             Self::Form => "form",
+            Self::Service => "service",
             Self::Handler => "handler",
             Self::Signal => "signal",
             Self::Task => "task",
@@ -46,6 +48,7 @@ impl NodeType {
 #[serde(rename_all = "snake_case")]
 pub enum EdgeType {
     Contains,
+    Calls,
     Inherits,
     RoutesTo,
     Queries,

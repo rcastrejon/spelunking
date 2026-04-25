@@ -106,6 +106,10 @@ impl FunctionSymbol {
     fn handler_node_key(&self) -> NodeKey {
         NodeKey::new(NodeType::Handler, self.python_qualified_name.clone())
     }
+
+    fn service_node_key(&self) -> NodeKey {
+        NodeKey::new(NodeType::Service, self.python_qualified_name.clone())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +297,19 @@ struct FunctionDefinition<'a> {
     name: &'a str,
     body: &'a ast::Suite,
     decorators: &'a [Expr],
+}
+
+struct ExecutableGraphContext<'a> {
+    model_nodes: &'a HashMap<usize, NodeIndex>,
+    task_nodes: &'a HashMap<usize, NodeIndex>,
+    service_nodes: &'a mut HashMap<usize, NodeIndex>,
+    emitted_service_functions: &'a mut HashSet<usize>,
+}
+
+struct RouteGraphContext<'a> {
+    data_layer_nodes: &'a HashMap<usize, NodeIndex>,
+    middleware_nodes: &'a [NodeIndex],
+    executable: ExecutableGraphContext<'a>,
 }
 
 #[derive(Debug, Default)]
@@ -809,11 +826,35 @@ impl DjangoProjectIndex {
         }
 
         let data_layer_nodes = self.emit_data_layer_graph(graph, &model_nodes);
-        let task_nodes = self.emit_task_graph(graph, &model_nodes);
-        self.emit_signal_graph(graph, &model_nodes, &task_nodes);
+        let mut service_nodes = HashMap::new();
+        let mut emitted_service_functions = HashSet::new();
+        let task_nodes = self.emit_task_graph(
+            graph,
+            &model_nodes,
+            &mut service_nodes,
+            &mut emitted_service_functions,
+        );
+        self.emit_signal_graph(
+            graph,
+            &model_nodes,
+            &task_nodes,
+            &mut service_nodes,
+            &mut emitted_service_functions,
+        );
         let middleware_nodes = self.emit_middleware_graph(graph);
 
-        self.emit_route_graph(graph, &data_layer_nodes, &model_nodes, &middleware_nodes);
+        let mut route_context = RouteGraphContext {
+            data_layer_nodes: &data_layer_nodes,
+            middleware_nodes: &middleware_nodes,
+            executable: ExecutableGraphContext {
+                model_nodes: &model_nodes,
+                task_nodes: &task_nodes,
+                service_nodes: &mut service_nodes,
+                emitted_service_functions: &mut emitted_service_functions,
+            },
+        };
+
+        self.emit_route_graph(graph, &mut route_context);
     }
 
     fn resolve_model_reference(
@@ -931,6 +972,8 @@ impl DjangoProjectIndex {
         &self,
         graph: &mut GraphBuilder,
         model_nodes: &HashMap<usize, NodeIndex>,
+        service_nodes: &mut HashMap<usize, NodeIndex>,
+        emitted_service_functions: &mut HashSet<usize>,
     ) -> HashMap<usize, NodeIndex> {
         let mut task_nodes = HashMap::new();
 
@@ -949,6 +992,13 @@ impl DjangoProjectIndex {
             task_nodes.insert(task_index, node);
         }
 
+        let mut context = ExecutableGraphContext {
+            model_nodes,
+            task_nodes: &task_nodes,
+            service_nodes,
+            emitted_service_functions,
+        };
+
         for (task_index, task) in self.tasks.iter().enumerate() {
             let function = &self.functions[task.function_index];
             let task_node = task_nodes[&task_index];
@@ -958,8 +1008,7 @@ impl DjangoProjectIndex {
                 task_node,
                 &function.python_module,
                 &function.references,
-                model_nodes,
-                &task_nodes,
+                &mut context,
             );
         }
 
@@ -971,9 +1020,17 @@ impl DjangoProjectIndex {
         graph: &mut GraphBuilder,
         model_nodes: &HashMap<usize, NodeIndex>,
         task_nodes: &HashMap<usize, NodeIndex>,
+        service_nodes: &mut HashMap<usize, NodeIndex>,
+        emitted_service_functions: &mut HashSet<usize>,
     ) {
         let mut handler_nodes = HashMap::new();
         let mut signal_receivers = self.signal_receivers.iter().collect::<Vec<_>>();
+        let mut context = ExecutableGraphContext {
+            model_nodes,
+            task_nodes,
+            service_nodes,
+            emitted_service_functions,
+        };
 
         signal_receivers.sort_by_key(|receiver| receiver.ordinal);
 
@@ -1008,8 +1065,7 @@ impl DjangoProjectIndex {
                     handler,
                     &function.python_module,
                     &function.references,
-                    model_nodes,
-                    task_nodes,
+                    &mut context,
                 );
             }
         }
@@ -1056,24 +1112,82 @@ impl DjangoProjectIndex {
         source_node: NodeIndex,
         python_module: &str,
         references: &SymbolReferences,
-        model_nodes: &HashMap<usize, NodeIndex>,
-        task_nodes: &HashMap<usize, NodeIndex>,
+        context: &mut ExecutableGraphContext<'_>,
     ) {
         for reference in references.sorted_values() {
             if let Some(model_index) =
                 self.resolve_model_reference_in_module(python_module, reference, None)
-                && let Some(&model_node) = model_nodes.get(&model_index)
+                && let Some(&model_node) = context.model_nodes.get(&model_index)
             {
                 graph.add_edge(source_node, model_node, EdgeType::Queries);
             }
 
             if let Some(task_index) = self.resolve_task_reference(reference)
-                && let Some(&task_node) = task_nodes.get(&task_index)
+                && let Some(&task_node) = context.task_nodes.get(&task_index)
                 && task_node != source_node
             {
                 graph.add_edge(source_node, task_node, EdgeType::Triggers);
             }
+
+            if let Some(function_index) = self.resolve_service_reference(reference) {
+                let service_node =
+                    self.service_node_for_function(graph, function_index, context.service_nodes);
+
+                if service_node != source_node {
+                    graph.add_edge(source_node, service_node, EdgeType::Calls);
+                }
+
+                self.emit_service_reference_edges(graph, function_index, context);
+            }
         }
+    }
+
+    fn emit_service_reference_edges(
+        &self,
+        graph: &mut GraphBuilder,
+        function_index: usize,
+        context: &mut ExecutableGraphContext<'_>,
+    ) {
+        if !context.emitted_service_functions.insert(function_index) {
+            return;
+        }
+
+        let service_node =
+            self.service_node_for_function(graph, function_index, context.service_nodes);
+        let function = &self.functions[function_index];
+
+        self.emit_executable_reference_edges(
+            graph,
+            service_node,
+            &function.python_module,
+            &function.references,
+            context,
+        );
+    }
+
+    fn service_node_for_function(
+        &self,
+        graph: &mut GraphBuilder,
+        function_index: usize,
+        service_nodes: &mut HashMap<usize, NodeIndex>,
+    ) -> NodeIndex {
+        if let Some(service_node) = service_nodes.get(&function_index) {
+            return *service_node;
+        }
+
+        let function = &self.functions[function_index];
+        let node = graph.add_node(
+            function.service_node_key(),
+            function.qualified_name.clone(),
+            Some(function.module_path.clone()),
+        );
+
+        if let Some(source_file) = function.source_file {
+            graph.add_edge(source_file, node, EdgeType::Contains);
+        }
+
+        service_nodes.insert(function_index, node);
+        node
     }
 
     fn emit_configured_app_graph(
@@ -1145,13 +1259,7 @@ impl DjangoProjectIndex {
         middleware_nodes
     }
 
-    fn emit_route_graph(
-        &self,
-        graph: &mut GraphBuilder,
-        data_layer_nodes: &HashMap<usize, NodeIndex>,
-        model_nodes: &HashMap<usize, NodeIndex>,
-        middleware_nodes: &[NodeIndex],
-    ) {
+    fn emit_route_graph(&self, graph: &mut GraphBuilder, context: &mut RouteGraphContext<'_>) {
         let mut view_nodes = HashMap::new();
 
         for route in &self.routes {
@@ -1168,14 +1276,14 @@ impl DjangoProjectIndex {
                 graph.add_edge(source_file, url, EdgeType::Contains);
             }
 
-            for &middleware in middleware_nodes {
+            for &middleware in context.middleware_nodes {
                 graph.add_edge(middleware, url, EdgeType::Intercepts);
             }
 
             let view = self.view_node_for_reference(graph, &route.view, &mut view_nodes);
 
             if let Some(view_index) = self.views_by_python_name.get(&route.view.value) {
-                self.emit_view_data_edges(graph, *view_index, view, data_layer_nodes, model_nodes);
+                self.emit_view_data_edges(graph, *view_index, view, context);
             }
 
             graph.add_edge(url, view, EdgeType::RoutesTo);
@@ -1222,26 +1330,33 @@ impl DjangoProjectIndex {
         graph: &mut GraphBuilder,
         view_index: usize,
         view_node: NodeIndex,
-        data_layer_nodes: &HashMap<usize, NodeIndex>,
-        model_nodes: &HashMap<usize, NodeIndex>,
+        context: &mut RouteGraphContext<'_>,
     ) {
         let view = &self.views[view_index];
 
         for reference in view.references.sorted_values() {
             if let Some(data_layer_index) =
                 self.resolve_data_layer_reference(&view.python_module, reference)
-                && let Some(&data_layer_node) = data_layer_nodes.get(&data_layer_index)
+                && let Some(&data_layer_node) = context.data_layer_nodes.get(&data_layer_index)
             {
                 graph.add_edge(view_node, data_layer_node, EdgeType::Serializes);
             }
 
             if let Some(model_index) =
                 self.resolve_model_reference_in_module(&view.python_module, reference, None)
-                && let Some(&model_node) = model_nodes.get(&model_index)
+                && let Some(&model_node) = context.executable.model_nodes.get(&model_index)
             {
                 graph.add_edge(view_node, model_node, EdgeType::Queries);
             }
         }
+
+        self.emit_executable_reference_edges(
+            graph,
+            view_node,
+            &view.python_module,
+            &view.references,
+            &mut context.executable,
+        );
     }
 
     fn resolve_data_layer_reference(&self, python_module: &str, reference: &str) -> Option<usize> {
@@ -1267,6 +1382,27 @@ impl DjangoProjectIndex {
         }
 
         None
+    }
+
+    fn resolve_service_reference(&self, reference: &str) -> Option<usize> {
+        self.resolve_function_reference(reference)
+            .filter(|function_index| self.is_service_function(*function_index))
+    }
+
+    fn is_service_function(&self, function_index: usize) -> bool {
+        let function = &self.functions[function_index];
+
+        !self
+            .routes
+            .iter()
+            .any(|route| route.view.value == function.python_qualified_name)
+            && !self
+                .tasks_by_python_name
+                .contains_key(&function.python_qualified_name)
+            && !self
+                .signal_receivers
+                .iter()
+                .any(|receiver| receiver.handler.value == function.python_qualified_name)
     }
 
     fn resolve_model_reference_in_module(
@@ -3946,6 +4082,108 @@ post_delete.connect(delete_audit_log, sender=Customer)
         assert!(graph.edges.iter().any(|edge| {
             edge.source == "task:shop.tasks.sync_customer"
                 && edge.target == "model:shop/models.py:AuditLog"
+                && edge.edge_type == EdgeType::Queries
+        }));
+    }
+
+    #[test]
+    fn maps_views_through_service_functions_to_models_and_tasks() {
+        let project = TempProject::new("django-service-flow");
+        let models = project.write(
+            "shop/models.py",
+            r#"
+from django.db import models
+
+class Order(models.Model):
+    pass
+
+class Invoice(models.Model):
+    pass
+"#,
+        );
+        let tasks = project.write(
+            "shop/tasks.py",
+            r#"
+from celery import shared_task
+from .models import Invoice
+
+@shared_task
+def send_invoice(order_id):
+    Invoice.objects.create()
+"#,
+        );
+        let services = project.write(
+            "shop/services.py",
+            r#"
+from .models import Order
+from .tasks import send_invoice
+
+def load_order(order_id):
+    return Order.objects.get(id=order_id)
+
+def checkout_order(order_id):
+    order = load_order(order_id)
+    send_invoice.delay(order.id)
+    return order
+"#,
+        );
+        let views = project.write(
+            "shop/views.py",
+            r#"
+from .services import checkout_order
+
+def checkout(request, order_id):
+    return checkout_order(order_id)
+"#,
+        );
+        let urls = project.write(
+            "shop/urls.py",
+            r#"
+from django.urls import path
+from .views import checkout
+
+urlpatterns = [
+    path("orders/<int:order_id>/checkout/", checkout, name="checkout"),
+]
+"#,
+        );
+        let files = vec![models, tasks, services, views, urls];
+        let report = parse_python_files(&files);
+
+        assert!(!report.has_diagnostics());
+
+        let graph = analyze_python_project(&project.path, &files, &report.modules);
+
+        assert_eq!(graph.node_count_by_type(NodeType::Url), 1);
+        assert_eq!(graph.node_count_by_type(NodeType::View), 1);
+        assert_eq!(graph.node_count_by_type(NodeType::Service), 2);
+        assert_eq!(graph.node_count_by_type(NodeType::Task), 1);
+        assert_eq!(graph.edge_count_by_type(EdgeType::Calls), 2);
+        assert_eq!(graph.edge_count_by_type(EdgeType::Triggers), 1);
+        assert_eq!(graph.edge_count_by_type(EdgeType::Queries), 2);
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "view:shop.views.checkout"
+                && edge.target == "service:shop.services.checkout_order"
+                && edge.edge_type == EdgeType::Calls
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "service:shop.services.checkout_order"
+                && edge.target == "service:shop.services.load_order"
+                && edge.edge_type == EdgeType::Calls
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "service:shop.services.load_order"
+                && edge.target == "model:shop/models.py:Order"
+                && edge.edge_type == EdgeType::Queries
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "service:shop.services.checkout_order"
+                && edge.target == "task:shop.tasks.send_invoice"
+                && edge.edge_type == EdgeType::Triggers
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "task:shop.tasks.send_invoice"
+                && edge.target == "model:shop/models.py:Invoice"
                 && edge.edge_type == EdgeType::Queries
         }));
     }

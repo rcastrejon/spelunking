@@ -98,6 +98,10 @@ fn print_summary(
     );
     println!("Django forms: {}", graph.node_count_by_type(NodeType::Form));
     println!(
+        "Django services: {}",
+        graph.node_count_by_type(NodeType::Service)
+    );
+    println!(
         "Django middleware: {}",
         graph.node_count_by_type(NodeType::Middleware)
     );
@@ -114,6 +118,7 @@ fn print_summary(
         "Model inheritance edges: {}",
         graph.edge_count_by_type(EdgeType::Inherits)
     );
+    println!("Call edges: {}", graph.edge_count_by_type(EdgeType::Calls));
     println!(
         "Model relationship edges: {}",
         graph.edge_count_by_type(EdgeType::RelatesTo)
