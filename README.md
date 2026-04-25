@@ -19,10 +19,29 @@ cargo run -p spelunking-cli -- /path/to/django-project
 
 Use `--list-files` to print every discovered Python file. Use `--fail-on-diagnostics` to return a non-zero exit code when any file cannot be read or parsed.
 
-The CLI can also emit the current graph contract as JSON. The graph contains source-file, Django app, model, URL, view, serializer, form, service, middleware, signal, signal handler, and task nodes, plus containment, call, inheritance, direct ORM relationship, URL routing, serialization, query, middleware intercept, and trigger edges:
+The CLI can also emit the current graph contract as versioned JSON. The export includes summary counts, filters, parse/read diagnostics, and the graph itself. The graph contains source-file, Django app, model, URL, view, serializer, form, service, middleware, signal, signal handler, and task nodes, plus containment, call, inheritance, direct ORM relationship, URL routing, serialization, query, middleware intercept, and trigger edges:
 
 ```sh
-cargo run -p spelunking-cli -- /path/to/django-project --format json
+cargo run -p spelunking-cli -- /path/to/django-project --format json --output graph.json
+```
+
+Use DOT output with Graphviz for visual rendering:
+
+```sh
+cargo run -p spelunking-cli -- /path/to/django-project --format dot --output graph.dot
+dot -Tsvg graph.dot > graph.svg
+```
+
+Large graphs can be narrowed with repeatable or comma-separated filters:
+
+```sh
+cargo run -p spelunking-cli -- /path/to/django-project \
+  --format dot \
+  --node-type url,view,model \
+  --edge-type routes_to,queries \
+  --path-prefix shop \
+  --drop-isolated \
+  --output shop-flow.dot
 ```
 
 Current Django analysis includes:

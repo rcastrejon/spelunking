@@ -5,7 +5,9 @@ use petgraph::{
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -26,7 +28,22 @@ pub enum NodeType {
 }
 
 impl NodeType {
-    fn as_id_prefix(self) -> &'static str {
+    pub const ALL: [Self; 12] = [
+        Self::SourceFile,
+        Self::App,
+        Self::Model,
+        Self::View,
+        Self::Url,
+        Self::Serializer,
+        Self::Form,
+        Self::Service,
+        Self::Handler,
+        Self::Signal,
+        Self::Task,
+        Self::Middleware,
+    ];
+
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::SourceFile => "source_file",
             Self::App => "app",
@@ -42,6 +59,34 @@ impl NodeType {
             Self::Middleware => "middleware",
         }
     }
+
+    fn as_id_prefix(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for NodeType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for NodeType {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let normalized = normalize_type_name(value);
+
+        Self::ALL
+            .into_iter()
+            .find(|node_type| node_type.as_str() == normalized)
+            .ok_or_else(|| {
+                format!(
+                    "unknown node type '{value}'. Expected one of: {}",
+                    type_names(Self::ALL)
+                )
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -56,6 +101,58 @@ pub enum EdgeType {
     Triggers,
     Intercepts,
     RelatesTo,
+}
+
+impl EdgeType {
+    pub const ALL: [Self; 9] = [
+        Self::Contains,
+        Self::Calls,
+        Self::Inherits,
+        Self::RoutesTo,
+        Self::Queries,
+        Self::Serializes,
+        Self::Triggers,
+        Self::Intercepts,
+        Self::RelatesTo,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Contains => "contains",
+            Self::Calls => "calls",
+            Self::Inherits => "inherits",
+            Self::RoutesTo => "routes_to",
+            Self::Queries => "queries",
+            Self::Serializes => "serializes",
+            Self::Triggers => "triggers",
+            Self::Intercepts => "intercepts",
+            Self::RelatesTo => "relates_to",
+        }
+    }
+}
+
+impl fmt::Display for EdgeType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for EdgeType {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let normalized = normalize_type_name(value);
+
+        Self::ALL
+            .into_iter()
+            .find(|edge_type| edge_type.as_str() == normalized)
+            .ok_or_else(|| {
+                format!(
+                    "unknown edge type '{value}'. Expected one of: {}",
+                    type_names(Self::ALL)
+                )
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -101,6 +198,14 @@ pub struct GraphExport {
     pub edges: Vec<Edge>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct GraphFilter {
+    pub node_types: HashSet<NodeType>,
+    pub edge_types: HashSet<EdgeType>,
+    pub path_prefixes: Vec<String>,
+    pub drop_isolated: bool,
+}
+
 impl GraphExport {
     pub fn node_count(&self) -> usize {
         self.nodes.len()
@@ -123,6 +228,92 @@ impl GraphExport {
             .filter(|edge| edge.edge_type == edge_type)
             .count()
     }
+
+    pub fn filtered(&self, filter: &GraphFilter) -> Self {
+        if filter.node_types.is_empty()
+            && filter.edge_types.is_empty()
+            && filter.path_prefixes.is_empty()
+            && !filter.drop_isolated
+        {
+            return self.clone();
+        }
+
+        let retained_node_ids = self
+            .nodes
+            .iter()
+            .filter(|node| node_matches_filter(node, filter))
+            .map(|node| node.id.clone())
+            .collect::<HashSet<_>>();
+
+        let edges = self
+            .edges
+            .iter()
+            .filter(|edge| edge_matches_filter(edge, &retained_node_ids, filter))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let retained_node_ids = if filter.drop_isolated {
+            edges
+                .iter()
+                .flat_map(|edge| [&edge.source, &edge.target])
+                .cloned()
+                .collect()
+        } else {
+            retained_node_ids
+        };
+
+        let nodes = self
+            .nodes
+            .iter()
+            .filter(|node| retained_node_ids.contains(&node.id))
+            .cloned()
+            .collect();
+
+        Self { nodes, edges }
+    }
+}
+
+fn node_matches_filter(node: &Node, filter: &GraphFilter) -> bool {
+    (filter.node_types.is_empty() || filter.node_types.contains(&node.node_type))
+        && (filter.path_prefixes.is_empty()
+            || node
+                .path
+                .as_deref()
+                .is_some_and(|path| path_matches_prefix(path, &filter.path_prefixes)))
+}
+
+fn edge_matches_filter(
+    edge: &Edge,
+    retained_node_ids: &HashSet<String>,
+    filter: &GraphFilter,
+) -> bool {
+    (filter.edge_types.is_empty() || filter.edge_types.contains(&edge.edge_type))
+        && retained_node_ids.contains(&edge.source)
+        && retained_node_ids.contains(&edge.target)
+}
+
+fn path_matches_prefix(path: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|prefix| {
+        path == prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|remainder| remainder.starts_with('/'))
+    })
+}
+
+fn normalize_type_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn type_names<T, const N: usize>(types: [T; N]) -> String
+where
+    T: fmt::Display,
+{
+    types
+        .into_iter()
+        .map(|node_type| node_type.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,5 +549,96 @@ mod tests {
 
         assert!(source_files.contains_key(&expected_key));
         assert_eq!(builder.node_count(), 1);
+    }
+
+    #[test]
+    fn filters_graph_by_node_and_edge_type() {
+        let graph = GraphExport {
+            nodes: vec![
+                Node {
+                    id: "url:products/".to_owned(),
+                    node_type: NodeType::Url,
+                    label: "products/".to_owned(),
+                    path: Some("shop/urls.py".to_owned()),
+                },
+                Node {
+                    id: "view:shop.views.index".to_owned(),
+                    node_type: NodeType::View,
+                    label: "index".to_owned(),
+                    path: Some("shop/views.py".to_owned()),
+                },
+                Node {
+                    id: "model:shop/models.py:Product".to_owned(),
+                    node_type: NodeType::Model,
+                    label: "Product".to_owned(),
+                    path: Some("shop/models.py".to_owned()),
+                },
+            ],
+            edges: vec![
+                Edge {
+                    source: "url:products/".to_owned(),
+                    target: "view:shop.views.index".to_owned(),
+                    edge_type: EdgeType::RoutesTo,
+                },
+                Edge {
+                    source: "view:shop.views.index".to_owned(),
+                    target: "model:shop/models.py:Product".to_owned(),
+                    edge_type: EdgeType::Queries,
+                },
+            ],
+        };
+        let filter = GraphFilter {
+            node_types: HashSet::from([NodeType::Url, NodeType::View]),
+            edge_types: HashSet::from([EdgeType::RoutesTo]),
+            path_prefixes: Vec::new(),
+            drop_isolated: false,
+        };
+
+        let filtered = graph.filtered(&filter);
+
+        assert_eq!(filtered.nodes.len(), 2);
+        assert_eq!(filtered.edges.len(), 1);
+        assert_eq!(filtered.edges[0].edge_type, EdgeType::RoutesTo);
+    }
+
+    #[test]
+    fn filters_graph_by_path_prefix() {
+        let graph = GraphExport {
+            nodes: vec![
+                Node {
+                    id: "model:shop/models.py:Product".to_owned(),
+                    node_type: NodeType::Model,
+                    label: "Product".to_owned(),
+                    path: Some("shop/models.py".to_owned()),
+                },
+                Node {
+                    id: "model:billing/models.py:Invoice".to_owned(),
+                    node_type: NodeType::Model,
+                    label: "Invoice".to_owned(),
+                    path: Some("billing/models.py".to_owned()),
+                },
+            ],
+            edges: Vec::new(),
+        };
+        let filter = GraphFilter {
+            node_types: HashSet::new(),
+            edge_types: HashSet::new(),
+            path_prefixes: vec!["shop".to_owned()],
+            drop_isolated: false,
+        };
+
+        let filtered = graph.filtered(&filter);
+
+        assert_eq!(filtered.nodes.len(), 1);
+        assert_eq!(filtered.nodes[0].label, "Product");
+    }
+
+    #[test]
+    fn parses_type_names_from_cli_friendly_strings() {
+        assert_eq!(
+            "source-file".parse::<NodeType>().unwrap(),
+            NodeType::SourceFile
+        );
+        assert_eq!("routes-to".parse::<EdgeType>().unwrap(), EdgeType::RoutesTo);
     }
 }

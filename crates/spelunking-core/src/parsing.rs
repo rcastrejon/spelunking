@@ -22,6 +22,15 @@ pub enum PythonParseDiagnosticKind {
     Syntax,
 }
 
+impl PythonParseDiagnosticKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Syntax => "syntax",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct PythonParseReport {
     pub modules: Vec<ParsedPythonModule>,

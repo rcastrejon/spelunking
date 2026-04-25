@@ -10,7 +10,8 @@ pub use analysis::{
 };
 pub use discovery::{DiscoveryError, discover_python_files};
 pub use graph::{
-    Edge, EdgeType, GraphBuilder, GraphExport, Node, NodeKey, NodeType, build_source_file_graph,
+    Edge, EdgeType, GraphBuilder, GraphExport, GraphFilter, Node, NodeKey, NodeType,
+    build_source_file_graph, relative_path_identifier,
 };
 pub use parsing::{
     ParsedPythonModule, PythonParseDiagnostic, PythonParseDiagnosticKind, PythonParseReport,
