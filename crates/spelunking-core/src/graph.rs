@@ -44,6 +44,7 @@ impl NodeType {
 #[serde(rename_all = "snake_case")]
 pub enum EdgeType {
     Contains,
+    Inherits,
     RoutesTo,
     Queries,
     Serializes,
@@ -108,6 +109,13 @@ impl GraphExport {
         self.nodes
             .iter()
             .filter(|node| node.node_type == node_type)
+            .count()
+    }
+
+    pub fn edge_count_by_type(&self, edge_type: EdgeType) -> usize {
+        self.edges
+            .iter()
+            .filter(|edge| edge.edge_type == edge_type)
             .count()
     }
 }

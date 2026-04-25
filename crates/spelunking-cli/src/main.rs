@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use spelunking_core::{
-    GraphExport, NodeType, PythonParseDiagnostic, analyze_python_project, discover_python_files,
-    parse_python_files,
+    EdgeType, GraphExport, NodeType, PythonParseDiagnostic, analyze_python_project,
+    discover_python_files, parse_python_files,
 };
 use std::{
     io::{self, Write},
@@ -85,9 +85,18 @@ fn print_summary(
     println!("Diagnostics: {}", parse_report.diagnostic_count());
     println!("Graph nodes: {}", graph.node_count());
     println!("Graph edges: {}", graph.edge_count());
+    println!("Django apps: {}", graph.node_count_by_type(NodeType::App));
     println!(
         "Django models: {}",
         graph.node_count_by_type(NodeType::Model)
+    );
+    println!(
+        "Model inheritance edges: {}",
+        graph.edge_count_by_type(EdgeType::Inherits)
+    );
+    println!(
+        "Model relationship edges: {}",
+        graph.edge_count_by_type(EdgeType::RelatesTo)
     );
 
     if cli.list_files {
