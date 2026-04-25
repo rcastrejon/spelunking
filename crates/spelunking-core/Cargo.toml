@@ -5,5 +5,7 @@ edition.workspace = true
 
 [dependencies]
 ignore.workspace = true
+petgraph.workspace = true
 rayon.workspace = true
 rustpython-parser.workspace = true
+serde.workspace = true

@@ -1,6 +1,12 @@
-use clap::Parser;
-use spelunking_core::{PythonParseDiagnostic, discover_python_files, parse_python_files};
-use std::{path::PathBuf, process::ExitCode};
+use clap::{Parser, ValueEnum};
+use spelunking_core::{
+    PythonParseDiagnostic, build_source_file_graph, discover_python_files, parse_python_files,
+};
+use std::{
+    io::{self, Write},
+    path::PathBuf,
+    process::ExitCode,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -11,6 +17,10 @@ struct Cli {
     /// Target project directory to inspect.
     target: PathBuf,
 
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Summary)]
+    format: OutputFormat,
+
     /// Print each discovered Python file after the summary.
     #[arg(long)]
     list_files: bool,
@@ -18,6 +28,12 @@ struct Cli {
     /// Return a non-zero exit code when any file cannot be read or parsed.
     #[arg(long)]
     fail_on_diagnostics: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    Summary,
+    Json,
 }
 
 fn main() -> ExitCode {
@@ -34,17 +50,14 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let python_files = discover_python_files(&cli.target)?;
     let parse_report = parse_python_files(&python_files);
 
-    println!("Target: {}", cli.target.display());
-    println!("Discovered Python files: {}", python_files.len());
-    println!("Parsed Python files: {}", parse_report.parsed_count());
-    println!("Diagnostics: {}", parse_report.diagnostic_count());
+    match cli.format {
+        OutputFormat::Summary => print_summary(&cli, &python_files, &parse_report),
+        OutputFormat::Json => {
+            let graph = build_source_file_graph(&cli.target, &python_files);
+            let mut stdout = io::stdout().lock();
 
-    if cli.list_files {
-        println!();
-        println!("Python files:");
-
-        for path in &python_files {
-            println!("{}", path.display());
+            serde_json::to_writer_pretty(&mut stdout, &graph)?;
+            writeln!(stdout)?;
         }
     }
 
@@ -57,6 +70,26 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+fn print_summary(
+    cli: &Cli,
+    python_files: &[PathBuf],
+    parse_report: &spelunking_core::PythonParseReport,
+) {
+    println!("Target: {}", cli.target.display());
+    println!("Discovered Python files: {}", python_files.len());
+    println!("Parsed Python files: {}", parse_report.parsed_count());
+    println!("Diagnostics: {}", parse_report.diagnostic_count());
+
+    if cli.list_files {
+        println!();
+        println!("Python files:");
+
+        for path in python_files {
+            println!("{}", path.display());
+        }
+    }
 }
 
 fn print_diagnostics(diagnostics: &[PythonParseDiagnostic]) {
