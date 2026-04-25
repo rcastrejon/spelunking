@@ -138,6 +138,7 @@ struct DjangoSettingsModule {
     source_file: Option<NodeIndex>,
     installed_apps: Vec<String>,
     middleware: Vec<String>,
+    context_processors: Vec<String>,
     root_urlconf: Option<String>,
 }
 
@@ -145,6 +146,7 @@ impl DjangoSettingsModule {
     fn has_runtime_context(&self) -> bool {
         !self.installed_apps.is_empty()
             || !self.middleware.is_empty()
+            || !self.context_processors.is_empty()
             || self.root_urlconf.is_some()
     }
 }
@@ -163,6 +165,13 @@ struct ConfiguredApp {
 
 #[derive(Debug, Clone)]
 struct ConfiguredMiddleware {
+    source_file: Option<NodeIndex>,
+    value: String,
+    ordinal: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ConfiguredContextProcessor {
     source_file: Option<NodeIndex>,
     value: String,
     ordinal: usize,
@@ -367,6 +376,7 @@ struct ExecutableGraphContext<'a> {
 struct RouteGraphContext<'a> {
     data_layer_nodes: &'a HashMap<usize, NodeIndex>,
     middleware_nodes: &'a [NodeIndex],
+    context_processor_nodes: &'a [NodeIndex],
     executable: ExecutableGraphContext<'a>,
 }
 
@@ -393,6 +403,7 @@ struct DjangoProjectIndex {
     app_configs_by_python_name: HashMap<String, AppConfigDefinition>,
     configured_apps: Vec<ConfiguredApp>,
     middleware: Vec<ConfiguredMiddleware>,
+    context_processors: Vec<ConfiguredContextProcessor>,
 }
 
 impl DjangoProjectIndex {
@@ -546,8 +557,10 @@ impl DjangoProjectIndex {
     fn resolve_runtime_context(&mut self) {
         self.configured_apps.clear();
         self.middleware.clear();
+        self.context_processors.clear();
 
         let mut middleware_ordinal = 0;
+        let mut context_processor_ordinal = 0;
 
         for settings in self.settings_modules.clone() {
             for installed_app in settings.installed_apps {
@@ -566,6 +579,15 @@ impl DjangoProjectIndex {
                     ordinal: middleware_ordinal,
                 });
                 middleware_ordinal += 1;
+            }
+
+            for context_processor in settings.context_processors {
+                self.context_processors.push(ConfiguredContextProcessor {
+                    source_file: settings.source_file,
+                    value: context_processor,
+                    ordinal: context_processor_ordinal,
+                });
+                context_processor_ordinal += 1;
             }
         }
 
@@ -967,10 +989,12 @@ impl DjangoProjectIndex {
             &mut emitted_service_functions,
         );
         let middleware_nodes = self.emit_middleware_graph(graph);
+        let context_processor_nodes = self.emit_context_processor_graph(graph);
 
         let mut route_context = RouteGraphContext {
             data_layer_nodes: &data_layer_nodes,
             middleware_nodes: &middleware_nodes,
+            context_processor_nodes: &context_processor_nodes,
             executable: ExecutableGraphContext {
                 model_nodes: &model_nodes,
                 task_nodes: &task_nodes,
@@ -1384,6 +1408,53 @@ impl DjangoProjectIndex {
         middleware_nodes
     }
 
+    fn emit_context_processor_graph(&self, graph: &mut GraphBuilder) -> Vec<NodeIndex> {
+        let mut context_processors = self.context_processors.iter().collect::<Vec<_>>();
+        let mut context_processor_nodes = Vec::new();
+        let mut emitted = HashSet::new();
+
+        context_processors.sort_by_key(|processor| processor.ordinal);
+
+        for reference in context_processors {
+            let (identifier, label, path, source_file) =
+                if let Some(function_index) = self.functions_by_python_name.get(&reference.value) {
+                    let function = &self.functions[*function_index];
+
+                    (
+                        function.python_qualified_name.clone(),
+                        function.qualified_name.clone(),
+                        Some(function.module_path.clone()),
+                        function.source_file,
+                    )
+                } else {
+                    (
+                        reference.value.clone(),
+                        class_name(&reference.value).to_owned(),
+                        None,
+                        reference.source_file,
+                    )
+                };
+
+            if !emitted.insert(identifier.clone()) {
+                continue;
+            }
+
+            let node = graph.add_node(
+                NodeKey::new(NodeType::ContextProcessor, identifier),
+                label,
+                path,
+            );
+
+            if let Some(source_file) = source_file {
+                graph.add_edge(source_file, node, EdgeType::Contains);
+            }
+
+            context_processor_nodes.push(node);
+        }
+
+        context_processor_nodes
+    }
+
     fn emit_route_graph(&self, graph: &mut GraphBuilder, context: &mut RouteGraphContext<'_>) {
         let mut view_nodes = HashMap::new();
 
@@ -1403,6 +1474,15 @@ impl DjangoProjectIndex {
 
             for &middleware in context.middleware_nodes {
                 graph.add_edge(middleware, url, EdgeType::Intercepts);
+            }
+
+            for &context_processor in context.context_processor_nodes {
+                graph.add_edge_with_attributes(
+                    context_processor,
+                    url,
+                    EdgeType::Intercepts,
+                    BTreeMap::from([("kind".to_owned(), "context_processor".to_owned())]),
+                );
             }
 
             let view = self.view_node_for_reference(graph, &route.view, &mut view_nodes);
@@ -1880,6 +1960,10 @@ fn collect_settings_assignment(settings: &mut DjangoSettingsModule, target: &Exp
     match target_name {
         "INSTALLED_APPS" => settings.installed_apps.extend(string_values(value)),
         "MIDDLEWARE" | "MIDDLEWARE_CLASSES" => settings.middleware.extend(string_values(value)),
+        "TEMPLATES" => settings
+            .context_processors
+            .extend(context_processors_from_templates(value)),
+        "TEMPLATE_CONTEXT_PROCESSORS" => settings.context_processors.extend(string_values(value)),
         "ROOT_URLCONF" => {
             if let Some(root_urlconf) = string_constant(value) {
                 settings.root_urlconf = Some(root_urlconf);
@@ -1887,6 +1971,42 @@ fn collect_settings_assignment(settings: &mut DjangoSettingsModule, target: &Exp
         }
         _ => {}
     }
+}
+
+fn context_processors_from_templates(expr: &Expr) -> Vec<String> {
+    match expr {
+        Expr::Dict(_) => context_processors_from_template_config(expr),
+        Expr::List(list) => list
+            .elts
+            .iter()
+            .flat_map(context_processors_from_template_config)
+            .collect(),
+        Expr::Tuple(tuple) => tuple
+            .elts
+            .iter()
+            .flat_map(context_processors_from_template_config)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn context_processors_from_template_config(expr: &Expr) -> Vec<String> {
+    dict_value_by_string_key(expr, "OPTIONS")
+        .and_then(|options| dict_value_by_string_key(options, "context_processors"))
+        .map(string_values)
+        .unwrap_or_default()
+}
+
+fn dict_value_by_string_key<'a>(expr: &'a Expr, expected_key: &str) -> Option<&'a Expr> {
+    let Expr::Dict(dict) = expr else {
+        return None;
+    };
+
+    dict.keys.iter().zip(&dict.values).find_map(|(key, value)| {
+        let key = key.as_ref().and_then(string_constant)?;
+
+        (key == expected_key).then_some(value)
+    })
 }
 
 fn collect_hidden_execution_in_suite(
@@ -4325,6 +4445,18 @@ MIDDLEWARE = [
     "project.middleware.TenantMiddleware",
 ]
 
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.request",
+                "project.context_processors.current_tenant",
+            ],
+        },
+    },
+]
+
 ROOT_URLCONF = "project.urls"
 "#,
         );
@@ -4343,6 +4475,13 @@ class ShopConfig(AppConfig):
             r#"
 class TenantMiddleware:
     pass
+"#,
+        );
+        let context_processors = project.write(
+            "project/context_processors.py",
+            r#"
+def current_tenant(request):
+    return {}
 "#,
         );
         let product_model = project.write(
@@ -4438,6 +4577,7 @@ def unused_view(request):
             settings,
             app_config,
             middleware,
+            context_processors,
             product_model,
             invoice_model,
             root_urls,
@@ -4467,7 +4607,8 @@ def unused_view(request):
             .expect("i18n_patterns should expand into configured root URLs");
 
         assert_eq!(graph.node_count_by_type(NodeType::Middleware), 2);
-        assert_eq!(graph.edge_count_by_type(EdgeType::Intercepts), 4);
+        assert_eq!(graph.node_count_by_type(NodeType::ContextProcessor), 2);
+        assert_eq!(graph.edge_count_by_type(EdgeType::Intercepts), 8);
         assert_eq!(graph.edge_count_by_type(EdgeType::RoutesTo), 2);
         assert_eq!(graph.edge_count_by_type(EdgeType::RelatesTo), 1);
         assert!(graph.nodes.iter().any(|node| {
@@ -4484,6 +4625,10 @@ def unused_view(request):
         assert!(graph.nodes.iter().any(|node| {
             node.id == "middleware:project.middleware.TenantMiddleware"
                 && node.path.as_deref() == Some("project/middleware.py")
+        }));
+        assert!(graph.nodes.iter().any(|node| {
+            node.id == "context_processor:project.context_processors.current_tenant"
+                && node.path.as_deref() == Some("project/context_processors.py")
         }));
         assert!(graph.edges.iter().any(|edge| {
             edge.source == "app:shop"
@@ -4504,6 +4649,18 @@ def unused_view(request):
             edge.source == "middleware:project.middleware.TenantMiddleware"
                 && edge.target == localized_url_id
                 && edge.edge_type == EdgeType::Intercepts
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "context_processor:project.context_processors.current_tenant"
+                && edge.target == url_id
+                && edge.edge_type == EdgeType::Intercepts
+                && edge.attributes.get("kind").map(String::as_str) == Some("context_processor")
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "context_processor:django.template.context_processors.request"
+                && edge.target == localized_url_id
+                && edge.edge_type == EdgeType::Intercepts
+                && edge.attributes.get("kind").map(String::as_str) == Some("context_processor")
         }));
     }
 

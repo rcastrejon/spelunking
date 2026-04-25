@@ -27,10 +27,11 @@ pub enum NodeType {
     Signal,
     Task,
     Middleware,
+    ContextProcessor,
 }
 
 impl NodeType {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::SourceFile,
         Self::App,
         Self::Model,
@@ -45,6 +46,7 @@ impl NodeType {
         Self::Signal,
         Self::Task,
         Self::Middleware,
+        Self::ContextProcessor,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -63,6 +65,7 @@ impl NodeType {
             Self::Signal => "signal",
             Self::Task => "task",
             Self::Middleware => "middleware",
+            Self::ContextProcessor => "context_processor",
         }
     }
 
@@ -697,6 +700,10 @@ mod tests {
         assert_eq!(
             "source-file".parse::<NodeType>().unwrap(),
             NodeType::SourceFile
+        );
+        assert_eq!(
+            "context-processor".parse::<NodeType>().unwrap(),
+            NodeType::ContextProcessor
         );
         assert_eq!("routes-to".parse::<EdgeType>().unwrap(), EdgeType::RoutesTo);
     }

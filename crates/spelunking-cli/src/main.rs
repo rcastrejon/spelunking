@@ -200,6 +200,11 @@ fn write_summary(
     )?;
     writeln!(
         output,
+        "Django context processors: {}",
+        graph.node_count_by_type(NodeType::ContextProcessor)
+    )?;
+    writeln!(
+        output,
         "Django signal handlers: {}",
         graph.node_count_by_type(NodeType::Handler)
     )?;
@@ -255,7 +260,7 @@ fn write_summary(
     )?;
     writeln!(
         output,
-        "Middleware intercept edges: {}",
+        "Global hook intercept edges: {}",
         graph.edge_count_by_type(EdgeType::Intercepts)
     )?;
     writeln!(
@@ -415,6 +420,7 @@ fn dot_node_shape(node_type: NodeType) -> &'static str {
         NodeType::Signal => "diamond",
         NodeType::Task => "hexagon",
         NodeType::Middleware => "octagon",
+        NodeType::ContextProcessor => "parallelogram",
         NodeType::Model
         | NodeType::View
         | NodeType::Serializer
