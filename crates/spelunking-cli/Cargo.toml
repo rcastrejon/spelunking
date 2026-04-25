@@ -1,0 +1,11 @@
+[package]
+name = "spelunking-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "spelunking"
+path = "src/main.rs"
+
+[dependencies]
+spelunking-core.workspace = true
