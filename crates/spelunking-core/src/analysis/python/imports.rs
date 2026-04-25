@@ -1,7 +1,7 @@
 use rustpython_parser::ast::{self, Expr};
 use std::collections::HashMap;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ImportIndex {
     aliases: HashMap<String, String>,
 }

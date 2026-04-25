@@ -5,6 +5,7 @@ use std::{fs, path::PathBuf};
 #[derive(Debug)]
 pub struct ParsedPythonModule {
     pub path: PathBuf,
+    pub source: String,
     pub ast: ast::Suite,
 }
 
@@ -90,7 +91,7 @@ fn parse_python_file(path: PathBuf) -> PythonParseOutcome {
     let source_path = path.to_string_lossy();
 
     match ast::Suite::parse(&source, &source_path) {
-        Ok(ast) => PythonParseOutcome::Parsed(ParsedPythonModule { path, ast }),
+        Ok(ast) => PythonParseOutcome::Parsed(ParsedPythonModule { path, source, ast }),
         Err(error) => PythonParseOutcome::Diagnostic(PythonParseDiagnostic {
             path,
             kind: PythonParseDiagnosticKind::Syntax,

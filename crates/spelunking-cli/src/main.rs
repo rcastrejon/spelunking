@@ -1,9 +1,9 @@
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use spelunking_core::{
-    Edge, EdgeType, GraphExport, GraphFilter, Node, NodeType, PythonParseDiagnostic,
-    PythonParseReport, analyze_python_project, discover_python_files, parse_python_files,
-    relative_path_identifier,
+    DjangoSubjectReport, Edge, EdgeType, GraphExport, GraphFilter, Node, NodeType,
+    PythonParseDiagnostic, PythonParseReport, analyze_python_project, discover_python_files,
+    inspect_django_subject, parse_python_files, relative_path_identifier,
 };
 use std::{
     collections::HashSet,
@@ -35,6 +35,10 @@ struct Cli {
     /// Print each discovered Python file after the summary.
     #[arg(long)]
     list_files: bool,
+
+    /// Inspect a Django model field, for example Reservation.status.
+    #[arg(long = "inspect-subject", value_name = "MODEL.FIELD")]
+    inspect_subject: Option<String>,
 
     /// Include only these node types. Repeat the flag or use comma-separated values.
     #[arg(long = "node-type", value_name = "TYPE", value_parser = parse_node_type, value_delimiter = ',')]
@@ -77,30 +81,47 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let python_files = discover_python_files(&cli.target)?;
     let parse_report = parse_python_files(&python_files);
-    let unfiltered_graph =
-        analyze_python_project(&cli.target, &python_files, &parse_report.modules);
-    let filter = graph_filter(&cli);
-    let graph = unfiltered_graph.filtered(&filter);
     let mut output = output_writer(cli.output.as_deref())?;
 
-    match cli.format {
-        OutputFormat::Summary => write_summary(
-            &mut output,
-            &cli,
-            &python_files,
-            &parse_report,
-            &unfiltered_graph,
-            &graph,
-        )?,
-        OutputFormat::Json => write_json_export(
-            &mut output,
-            &cli,
-            &python_files,
-            &parse_report,
-            &unfiltered_graph,
-            &graph,
-        )?,
-        OutputFormat::Dot => write_dot(&mut output, &graph)?,
+    if let Some(subject) = &cli.inspect_subject {
+        let report = inspect_django_subject(&cli.target, &parse_report.modules, subject)?;
+
+        match cli.format {
+            OutputFormat::Summary => write_subject_summary(&mut output, &report)?,
+            OutputFormat::Json => write_subject_json(&mut output, &report)?,
+            OutputFormat::Dot => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--inspect-subject supports --format summary or --format json",
+                )
+                .into());
+            }
+        }
+    } else {
+        let unfiltered_graph =
+            analyze_python_project(&cli.target, &python_files, &parse_report.modules);
+        let filter = graph_filter(&cli);
+        let graph = unfiltered_graph.filtered(&filter);
+
+        match cli.format {
+            OutputFormat::Summary => write_summary(
+                &mut output,
+                &cli,
+                &python_files,
+                &parse_report,
+                &unfiltered_graph,
+                &graph,
+            )?,
+            OutputFormat::Json => write_json_export(
+                &mut output,
+                &cli,
+                &python_files,
+                &parse_report,
+                &unfiltered_graph,
+                &graph,
+            )?,
+            OutputFormat::Dot => write_dot(&mut output, &graph)?,
+        }
     }
 
     output.flush()?;
@@ -114,6 +135,151 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+fn write_subject_summary(output: &mut dyn Write, report: &DjangoSubjectReport) -> io::Result<()> {
+    writeln!(output, "Subject: {}", report.subject)?;
+
+    let Some(model) = &report.model else {
+        writeln!(output)?;
+        writeln!(output, "Model: not found")?;
+        writeln!(output, "Confidence: {}", report.confidence)?;
+        return Ok(());
+    };
+
+    writeln!(output)?;
+    writeln!(output, "Model:")?;
+    writeln!(output, "- {}", model.name)?;
+    writeln!(output, "- Defined in {}:{}", model.path, model.line)?;
+    writeln!(output, "- Confidence: {}", model.confidence)?;
+
+    writeln!(output)?;
+    writeln!(output, "Lifecycle candidate:")?;
+    if let Some(candidate) = &report.lifecycle_candidate {
+        writeln!(
+            output,
+            "- Field: {} ({})",
+            candidate.field, candidate.field_type
+        )?;
+
+        if candidate.states.is_empty() {
+            writeln!(output, "- States detected: none")?;
+        } else {
+            writeln!(
+                output,
+                "- States detected: {}",
+                candidate
+                    .states
+                    .iter()
+                    .map(|state| state.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
+        }
+
+        writeln!(output, "- Evidence: {}:{}", model.path, candidate.line)?;
+        writeln!(output, "- Confidence: {}", candidate.confidence)?;
+    } else {
+        writeln!(output, "- Field not found")?;
+    }
+
+    writeln!(output)?;
+    writeln!(output, "Primary fields:")?;
+    write_limited_items(output, &report.fields, 12, |output, field| {
+        let marker = if field.is_subject { " subject" } else { "" };
+        writeln!(
+            output,
+            "- {}: {} ({}:{}){}",
+            field.name, field.field_type, field.path, field.line, marker
+        )
+    })?;
+
+    writeln!(output)?;
+    writeln!(output, "Related models:")?;
+    write_limited_items(
+        output,
+        &report.related_models,
+        12,
+        |output, relationship| {
+            writeln!(
+                output,
+                "- {} via {} {} ({}:{})",
+                relationship.model,
+                relationship.relationship,
+                relationship.field,
+                relationship.path,
+                relationship.line
+            )
+        },
+    )?;
+
+    writeln!(output)?;
+    writeln!(output, "Relevant methods:")?;
+    write_limited_items(output, &report.relevant_methods, 12, |output, method| {
+        writeln!(
+            output,
+            "- {} ({}:{}) - {}",
+            method.name, method.path, method.line, method.reason
+        )
+    })?;
+
+    writeln!(output)?;
+    writeln!(output, "Related Django components:")?;
+    write_limited_items(
+        output,
+        &report.related_components,
+        12,
+        |output, component| {
+            writeln!(
+                output,
+                "- {} {} ({}:{}) - {}",
+                component.kind, component.name, component.path, component.line, component.reason
+            )
+        },
+    )?;
+
+    writeln!(output)?;
+    writeln!(output, "Evidence:")?;
+    write_limited_items(output, &report.evidence, 16, |output, evidence| {
+        writeln!(
+            output,
+            "- {}:{} {}",
+            evidence.path, evidence.line, evidence.detail
+        )
+    })?;
+
+    writeln!(output)?;
+    writeln!(output, "Confidence: {}", report.confidence)
+}
+
+fn write_subject_json(
+    output: &mut dyn Write,
+    report: &DjangoSubjectReport,
+) -> Result<(), serde_json::Error> {
+    serde_json::to_writer_pretty(&mut *output, report)?;
+    writeln!(output).map_err(serde_json::Error::io)
+}
+
+fn write_limited_items<T>(
+    output: &mut dyn Write,
+    values: &[T],
+    limit: usize,
+    mut write_item: impl FnMut(&mut dyn Write, &T) -> io::Result<()>,
+) -> io::Result<()> {
+    if values.is_empty() {
+        writeln!(output, "- none")?;
+        return Ok(());
+    }
+
+    for value in values.iter().take(limit) {
+        write_item(output, value)?;
+    }
+
+    if values.len() > limit {
+        writeln!(output, "- ... {} more omitted", values.len() - limit)?;
+    }
+
+    Ok(())
 }
 
 fn write_summary(
