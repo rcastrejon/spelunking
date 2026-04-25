@@ -1,9 +1,10 @@
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use spelunking_core::{
-    DjangoSubjectReport, Edge, EdgeType, GraphExport, GraphFilter, Node, NodeType,
-    PythonParseDiagnostic, PythonParseReport, analyze_python_project, discover_python_files,
-    inspect_django_subject, parse_python_files, relative_path_identifier,
+    DjangoBehaviorReport, DjangoSubjectReport, Edge, EdgeType, GraphExport, GraphFilter, Node,
+    NodeType, PythonParseDiagnostic, PythonParseReport, analyze_python_project,
+    discover_python_files, inspect_django_behavior, inspect_django_subject, parse_python_files,
+    relative_path_identifier,
 };
 use std::{
     collections::HashSet,
@@ -39,6 +40,10 @@ struct Cli {
     /// Inspect a Django model field, for example Reservation.status.
     #[arg(long = "inspect-subject", value_name = "MODEL.FIELD")]
     inspect_subject: Option<String>,
+
+    /// Inspect mutation sites and behavior paths for a Django model field.
+    #[arg(long = "inspect-behavior", value_name = "MODEL.FIELD")]
+    inspect_behavior: Option<String>,
 
     /// Include only these node types. Repeat the flag or use comma-separated values.
     #[arg(long = "node-type", value_name = "TYPE", value_parser = parse_node_type, value_delimiter = ',')]
@@ -79,11 +84,33 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    if cli.inspect_subject.is_some() && cli.inspect_behavior.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--inspect-subject and --inspect-behavior cannot be used together",
+        )
+        .into());
+    }
+
     let python_files = discover_python_files(&cli.target)?;
     let parse_report = parse_python_files(&python_files);
     let mut output = output_writer(cli.output.as_deref())?;
 
-    if let Some(subject) = &cli.inspect_subject {
+    if let Some(subject) = &cli.inspect_behavior {
+        let report = inspect_django_behavior(&cli.target, &parse_report.modules, subject)?;
+
+        match cli.format {
+            OutputFormat::Summary => write_behavior_summary(&mut output, &report)?,
+            OutputFormat::Json => write_behavior_json(&mut output, &report)?,
+            OutputFormat::Dot => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--inspect-behavior supports --format summary or --format json",
+                )
+                .into());
+            }
+        }
+    } else if let Some(subject) = &cli.inspect_subject {
         let report = inspect_django_subject(&cli.target, &parse_report.modules, subject)?;
 
         match cli.format {
@@ -255,6 +282,71 @@ fn write_subject_summary(output: &mut dyn Write, report: &DjangoSubjectReport) -
 fn write_subject_json(
     output: &mut dyn Write,
     report: &DjangoSubjectReport,
+) -> Result<(), serde_json::Error> {
+    serde_json::to_writer_pretty(&mut *output, report)?;
+    writeln!(output).map_err(serde_json::Error::io)
+}
+
+fn write_behavior_summary(output: &mut dyn Write, report: &DjangoBehaviorReport) -> io::Result<()> {
+    writeln!(output, "Behavior map: {}", report.subject)?;
+
+    let Some(model) = &report.model else {
+        writeln!(output)?;
+        writeln!(output, "Model: not found")?;
+        writeln!(output, "Confidence: {}", report.confidence)?;
+        return Ok(());
+    };
+
+    writeln!(output)?;
+    writeln!(output, "Model:")?;
+    writeln!(output, "- {}", model.name)?;
+    writeln!(output, "- Defined in {}:{}", model.path, model.line)?;
+
+    writeln!(output)?;
+    writeln!(output, "Mutation sites:")?;
+    write_limited_items(output, &report.mutation_sites, 20, |output, site| {
+        writeln!(
+            output,
+            "- {} in {} {} ({}:{})",
+            site.kind, site.container_kind, site.container_name, site.path, site.line
+        )?;
+        writeln!(output, "  {}", site.mutation)?;
+        writeln!(output, "  Confidence: {}", site.confidence)
+    })?;
+
+    writeln!(output)?;
+    writeln!(output, "Behavior paths:")?;
+    write_limited_items(output, &report.behavior_paths, 12, |output, path| {
+        writeln!(output, "- {} ({})", path.kind, path.confidence)?;
+
+        for step in &path.steps {
+            writeln!(
+                output,
+                "  -> {} {} ({}:{})",
+                step.kind, step.name, step.path, step.line
+            )?;
+        }
+
+        Ok(())
+    })?;
+
+    writeln!(output)?;
+    writeln!(output, "Evidence:")?;
+    write_limited_items(output, &report.evidence, 20, |output, evidence| {
+        writeln!(
+            output,
+            "- {}:{} {}",
+            evidence.path, evidence.line, evidence.detail
+        )
+    })?;
+
+    writeln!(output)?;
+    writeln!(output, "Confidence: {}", report.confidence)
+}
+
+fn write_behavior_json(
+    output: &mut dyn Write,
+    report: &DjangoBehaviorReport,
 ) -> Result<(), serde_json::Error> {
     serde_json::to_writer_pretty(&mut *output, report)?;
     writeln!(output).map_err(serde_json::Error::io)
