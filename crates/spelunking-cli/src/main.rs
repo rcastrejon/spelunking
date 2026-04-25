@@ -1,6 +1,7 @@
 use clap::{Parser, ValueEnum};
 use spelunking_core::{
-    PythonParseDiagnostic, build_source_file_graph, discover_python_files, parse_python_files,
+    GraphExport, NodeType, PythonParseDiagnostic, analyze_python_project, discover_python_files,
+    parse_python_files,
 };
 use std::{
     io::{self, Write},
@@ -49,11 +50,11 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let python_files = discover_python_files(&cli.target)?;
     let parse_report = parse_python_files(&python_files);
+    let graph = analyze_python_project(&cli.target, &python_files, &parse_report.modules);
 
     match cli.format {
-        OutputFormat::Summary => print_summary(&cli, &python_files, &parse_report),
+        OutputFormat::Summary => print_summary(&cli, &python_files, &parse_report, &graph),
         OutputFormat::Json => {
-            let graph = build_source_file_graph(&cli.target, &python_files);
             let mut stdout = io::stdout().lock();
 
             serde_json::to_writer_pretty(&mut stdout, &graph)?;
@@ -76,11 +77,18 @@ fn print_summary(
     cli: &Cli,
     python_files: &[PathBuf],
     parse_report: &spelunking_core::PythonParseReport,
+    graph: &GraphExport,
 ) {
     println!("Target: {}", cli.target.display());
     println!("Discovered Python files: {}", python_files.len());
     println!("Parsed Python files: {}", parse_report.parsed_count());
     println!("Diagnostics: {}", parse_report.diagnostic_count());
+    println!("Graph nodes: {}", graph.node_count());
+    println!("Graph edges: {}", graph.edge_count());
+    println!(
+        "Django models: {}",
+        graph.node_count_by_type(NodeType::Model)
+    );
 
     if cli.list_files {
         println!();

@@ -19,7 +19,7 @@ cargo run -p spelunking-cli -- /path/to/django-project
 
 Use `--list-files` to print every discovered Python file. Use `--fail-on-diagnostics` to return a non-zero exit code when any file cannot be read or parsed.
 
-The CLI can also emit the current graph contract as JSON. At this stage the graph contains source-file nodes only:
+The CLI can also emit the current graph contract as JSON. At this stage the graph contains source-file nodes, discovered Django model nodes, and containment edges from files to models:
 
 ```sh
 cargo run -p spelunking-cli -- /path/to/django-project --format json

@@ -4,7 +4,7 @@ use petgraph::{
 };
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -95,6 +95,23 @@ pub struct GraphExport {
     pub edges: Vec<Edge>,
 }
 
+impl GraphExport {
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    pub fn node_count_by_type(&self, node_type: NodeType) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| node.node_type == node_type)
+            .count()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EdgeData {
     edge_type: EdgeType,
@@ -104,6 +121,7 @@ struct EdgeData {
 pub struct GraphBuilder {
     graph: DiGraph<Node, EdgeData>,
     indices_by_key: HashMap<NodeKey, NodeIndex>,
+    edge_keys: HashSet<(usize, usize, EdgeType)>,
 }
 
 impl GraphBuilder {
@@ -134,7 +152,12 @@ impl GraphBuilder {
     }
 
     pub fn add_edge(&mut self, source: NodeIndex, target: NodeIndex, edge_type: EdgeType) {
-        self.graph.add_edge(source, target, EdgeData { edge_type });
+        if self
+            .edge_keys
+            .insert((source.index(), target.index(), edge_type))
+        {
+            self.graph.add_edge(source, target, EdgeData { edge_type });
+        }
     }
 
     pub fn node_count(&self) -> usize {
@@ -170,23 +193,56 @@ pub fn build_source_file_graph(root: impl AsRef<Path>, paths: &[PathBuf]) -> Gra
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut builder = GraphBuilder::new();
 
-    for path in paths {
-        let relative_path = relative_path(&root, path);
-        builder.add_node(
-            NodeKey::new(NodeType::SourceFile, relative_path.clone()),
-            relative_path.clone(),
-            Some(relative_path),
-        );
-    }
+    add_source_file_nodes(&mut builder, &root, paths);
 
     builder.export()
 }
 
-fn relative_path(root: &Path, path: &Path) -> String {
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let relative = path.strip_prefix(root).unwrap_or(&path);
+pub fn add_source_file_nodes(
+    builder: &mut GraphBuilder,
+    root: impl AsRef<Path>,
+    paths: &[PathBuf],
+) -> HashMap<PathBuf, NodeIndex> {
+    let root = root.as_ref();
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut source_files_by_path = HashMap::new();
+
+    for path in paths {
+        let index = add_source_file_node(builder, &root, path);
+        source_files_by_path.insert(canonical_path(path), index);
+    }
+
+    source_files_by_path
+}
+
+pub fn add_source_file_node(
+    builder: &mut GraphBuilder,
+    root: impl AsRef<Path>,
+    path: impl AsRef<Path>,
+) -> NodeIndex {
+    let root = root.as_ref();
+    let path = path.as_ref();
+    let relative_path = relative_path_identifier(root, path);
+
+    builder.add_node(
+        NodeKey::new(NodeType::SourceFile, relative_path.clone()),
+        relative_path.clone(),
+        Some(relative_path),
+    )
+}
+
+pub fn relative_path_identifier(root: impl AsRef<Path>, path: impl AsRef<Path>) -> String {
+    let root = canonical_path(root.as_ref());
+    let path = canonical_path(path.as_ref());
+    let relative = path.strip_prefix(&root).unwrap_or(&path);
 
     normalize_path(relative)
+}
+
+pub fn canonical_path(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn normalize_path(path: &Path) -> String {
@@ -239,6 +295,22 @@ mod tests {
     }
 
     #[test]
+    fn deduplicates_edges_by_source_target_and_type() {
+        let mut builder = GraphBuilder::new();
+        let source = builder.add_node(NodeKey::new(NodeType::Url, "products/"), "products/", None);
+        let target = builder.add_node(
+            NodeKey::new(NodeType::View, "products.index"),
+            "index",
+            None,
+        );
+
+        builder.add_edge(source, target, EdgeType::RoutesTo);
+        builder.add_edge(source, target, EdgeType::RoutesTo);
+
+        assert_eq!(builder.edge_count(), 1);
+    }
+
+    #[test]
     fn builds_source_file_graph_with_relative_paths() {
         let root = std::env::temp_dir().join(format!("spelunking-graph-{}", std::process::id()));
         let file = root.join("app/models.py");
@@ -255,5 +327,23 @@ mod tests {
         assert_eq!(graph.nodes[0].label, "app/models.py");
         assert_eq!(graph.nodes[0].path.as_deref(), Some("app/models.py"));
         assert!(graph.edges.is_empty());
+    }
+
+    #[test]
+    fn indexes_source_file_nodes_by_canonical_path() {
+        let root =
+            std::env::temp_dir().join(format!("spelunking-graph-index-{}", std::process::id()));
+        let file = root.join("app/models.py");
+
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "").unwrap();
+        let expected_key = file.canonicalize().unwrap();
+
+        let mut builder = GraphBuilder::new();
+        let source_files = add_source_file_nodes(&mut builder, &root, std::slice::from_ref(&file));
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(source_files.contains_key(&expected_key));
+        assert_eq!(builder.node_count(), 1);
     }
 }
