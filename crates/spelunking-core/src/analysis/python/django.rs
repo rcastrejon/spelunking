@@ -26,6 +26,7 @@ impl Analyzer for DjangoModelAnalyzer {
     fn analyze(&self, context: &AnalysisContext<'_>, graph: &mut GraphBuilder) {
         let mut index = DjangoProjectIndex::from_context(context);
         index.resolve_model_classes();
+        index.resolve_data_layers();
         index.resolve_routes();
         index.emit_graph(graph);
     }
@@ -40,6 +41,7 @@ struct ClassSymbol {
     python_qualified_name: String,
     bases: Vec<ModelReference>,
     relationships: Vec<ModelRelationship>,
+    data_model: Option<ModelReference>,
     app: Option<DjangoApp>,
 }
 
@@ -53,12 +55,34 @@ impl ClassSymbol {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataLayerKind {
+    Serializer,
+    Form,
+}
+
+impl DataLayerKind {
+    fn node_type(self) -> NodeType {
+        match self {
+            Self::Serializer => NodeType::Serializer,
+            Self::Form => NodeType::Form,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DataLayer {
+    kind: DataLayerKind,
+}
+
 #[derive(Debug, Clone)]
 struct ViewSymbol {
     source_file: Option<NodeIndex>,
     module_path: String,
+    python_module: String,
     qualified_name: String,
     python_qualified_name: String,
+    references: SymbolReferences,
 }
 
 impl ViewSymbol {
@@ -115,6 +139,24 @@ impl ViewReference {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct SymbolReferences {
+    values: HashSet<String>,
+}
+
+impl SymbolReferences {
+    fn add(&mut self, value: impl Into<String>) {
+        self.values.insert(value.into());
+    }
+
+    fn sorted_values(&self) -> Vec<&str> {
+        let mut values = self.values.iter().map(String::as_str).collect::<Vec<_>>();
+
+        values.sort_unstable();
+        values
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RawRoutePattern {
     source_file: Option<NodeIndex>,
@@ -162,6 +204,7 @@ struct DjangoProjectIndex {
     classes_by_module_local_name: HashMap<(String, String), usize>,
     classes_by_app_and_name: HashMap<(String, String), usize>,
     model_class_indices: HashSet<usize>,
+    data_layers_by_class_index: HashMap<usize, DataLayer>,
     views: Vec<ViewSymbol>,
     views_by_python_name: HashMap<String, usize>,
     raw_routes: Vec<RawRoutePattern>,
@@ -306,6 +349,41 @@ impl DjangoProjectIndex {
         is_model
     }
 
+    fn resolve_data_layers(&mut self) {
+        let mut resolution_state = vec![DataLayerResolutionState::Unvisited; self.classes.len()];
+
+        for class_index in 0..self.classes.len() {
+            if let Some(kind) = self.data_layer_kind(class_index, &mut resolution_state) {
+                self.data_layers_by_class_index
+                    .insert(class_index, DataLayer { kind });
+            }
+        }
+    }
+
+    fn data_layer_kind(
+        &self,
+        class_index: usize,
+        state: &mut [DataLayerResolutionState],
+    ) -> Option<DataLayerKind> {
+        match state[class_index] {
+            DataLayerResolutionState::Resolved(kind) => return kind,
+            DataLayerResolutionState::Visiting => return None,
+            DataLayerResolutionState::Unvisited => {}
+        }
+
+        state[class_index] = DataLayerResolutionState::Visiting;
+
+        let kind = self.classes[class_index].bases.iter().find_map(|base| {
+            direct_data_layer_kind(&base.value).or_else(|| {
+                self.resolve_class_reference(class_index, &base.value)
+                    .and_then(|base_index| self.data_layer_kind(base_index, state))
+            })
+        });
+
+        state[class_index] = DataLayerResolutionState::Resolved(kind);
+        kind
+    }
+
     fn resolve_routes(&mut self) {
         self.routes.clear();
 
@@ -447,7 +525,9 @@ impl DjangoProjectIndex {
             }
         }
 
-        self.emit_route_graph(graph);
+        let data_layer_nodes = self.emit_data_layer_graph(graph, &model_nodes);
+
+        self.emit_route_graph(graph, &data_layer_nodes, &model_nodes);
     }
 
     fn resolve_model_reference(
@@ -461,15 +541,10 @@ impl DjangoProjectIndex {
             return Some(current_class_index);
         }
 
-        if let Some(class_index) = self.classes_by_python_name.get(&reference.value) {
-            return Some(*class_index);
-        }
-
-        if let Some(class_index) = self
-            .classes_by_module_local_name
-            .get(&(current_class.python_module.clone(), reference.value.clone()))
+        if let Some(class_index) =
+            self.resolve_class_reference_in_module(&current_class.python_module, &reference.value)
         {
-            return Some(*class_index);
+            return Some(class_index);
         }
 
         if let Some(app_label) = current_class.app.as_ref().map(|app| app.label.as_str())
@@ -491,7 +566,87 @@ impl DjangoProjectIndex {
         None
     }
 
-    fn emit_route_graph(&self, graph: &mut GraphBuilder) {
+    fn resolve_class_reference(
+        &self,
+        current_class_index: usize,
+        reference: &str,
+    ) -> Option<usize> {
+        let current_class = &self.classes[current_class_index];
+
+        self.resolve_class_reference_in_module(&current_class.python_module, reference)
+    }
+
+    fn resolve_class_reference_in_module(
+        &self,
+        python_module: &str,
+        reference: &str,
+    ) -> Option<usize> {
+        for candidate in reference_prefixes(reference) {
+            if let Some(class_index) = self.classes_by_python_name.get(candidate) {
+                return Some(*class_index);
+            }
+
+            if let Some(class_index) = self
+                .classes_by_module_local_name
+                .get(&(python_module.to_owned(), candidate.to_owned()))
+            {
+                return Some(*class_index);
+            }
+        }
+
+        None
+    }
+
+    fn emit_data_layer_graph(
+        &self,
+        graph: &mut GraphBuilder,
+        model_nodes: &HashMap<usize, NodeIndex>,
+    ) -> HashMap<usize, NodeIndex> {
+        let mut data_layer_nodes = HashMap::new();
+        let mut data_layer_class_indices = self
+            .data_layers_by_class_index
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+
+        data_layer_class_indices.sort_unstable();
+
+        for class_index in data_layer_class_indices {
+            let class = &self.classes[class_index];
+            let data_layer = self.data_layers_by_class_index[&class_index];
+            let node = graph.add_node(
+                NodeKey::new(
+                    data_layer.kind.node_type(),
+                    class.python_qualified_name.clone(),
+                ),
+                class.qualified_name.clone(),
+                Some(class.module_path.clone()),
+            );
+
+            data_layer_nodes.insert(class_index, node);
+
+            if let Some(source_file) = class.source_file {
+                graph.add_edge(source_file, node, EdgeType::Contains);
+            }
+
+            if let Some(model_reference) = &class.data_model
+                && let Some(model_index) =
+                    self.resolve_model_reference(class_index, model_reference)
+                && let Some(&model_node) = model_nodes.get(&model_index)
+            {
+                graph.add_edge(node, model_node, EdgeType::Serializes);
+            }
+        }
+
+        data_layer_nodes
+    }
+
+    fn emit_route_graph(
+        &self,
+        graph: &mut GraphBuilder,
+        data_layer_nodes: &HashMap<usize, NodeIndex>,
+        model_nodes: &HashMap<usize, NodeIndex>,
+    ) {
         let mut view_nodes = HashMap::new();
 
         for route in &self.routes {
@@ -509,6 +664,10 @@ impl DjangoProjectIndex {
             }
 
             let view = self.view_node_for_reference(graph, &route.view, &mut view_nodes);
+
+            if let Some(view_index) = self.views_by_python_name.get(&route.view.value) {
+                self.emit_view_data_edges(graph, *view_index, view, data_layer_nodes, model_nodes);
+            }
 
             graph.add_edge(url, view, EdgeType::RoutesTo);
         }
@@ -548,6 +707,72 @@ impl DjangoProjectIndex {
         view_nodes.insert(reference.value.clone(), node);
         node
     }
+
+    fn emit_view_data_edges(
+        &self,
+        graph: &mut GraphBuilder,
+        view_index: usize,
+        view_node: NodeIndex,
+        data_layer_nodes: &HashMap<usize, NodeIndex>,
+        model_nodes: &HashMap<usize, NodeIndex>,
+    ) {
+        let view = &self.views[view_index];
+
+        for reference in view.references.sorted_values() {
+            if let Some(data_layer_index) =
+                self.resolve_data_layer_reference(&view.python_module, reference)
+                && let Some(&data_layer_node) = data_layer_nodes.get(&data_layer_index)
+            {
+                graph.add_edge(view_node, data_layer_node, EdgeType::Serializes);
+            }
+
+            if let Some(model_index) =
+                self.resolve_model_reference_in_module(&view.python_module, reference, None)
+                && let Some(&model_node) = model_nodes.get(&model_index)
+            {
+                graph.add_edge(view_node, model_node, EdgeType::Queries);
+            }
+        }
+    }
+
+    fn resolve_data_layer_reference(&self, python_module: &str, reference: &str) -> Option<usize> {
+        self.resolve_class_reference_in_module(python_module, reference)
+            .filter(|class_index| self.data_layers_by_class_index.contains_key(class_index))
+    }
+
+    fn resolve_model_reference_in_module(
+        &self,
+        python_module: &str,
+        reference: &str,
+        app: Option<&DjangoApp>,
+    ) -> Option<usize> {
+        if let Some(class_index) = self
+            .resolve_class_reference_in_module(python_module, reference)
+            .filter(|class_index| self.model_class_indices.contains(class_index))
+        {
+            return Some(class_index);
+        }
+
+        if let Some(app_label) = app.map(|app| app.label.as_str())
+            && let Some(class_index) = self
+                .classes_by_app_and_name
+                .get(&(app_label.to_owned(), reference.to_owned()))
+                .filter(|class_index| self.model_class_indices.contains(class_index))
+        {
+            return Some(*class_index);
+        }
+
+        if let Some((app_label, model_name)) = reference.split_once('.')
+            && let Some(class_index) = self
+                .classes_by_app_and_name
+                .get(&(app_label.to_owned(), model_name.to_owned()))
+                .filter(|class_index| self.model_class_indices.contains(class_index))
+        {
+            return Some(*class_index);
+        }
+
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -555,6 +780,13 @@ enum ResolutionState {
     Unvisited,
     Visiting,
     Resolved(bool),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataLayerResolutionState {
+    Unvisited,
+    Visiting,
+    Resolved(Option<DataLayerKind>),
 }
 
 fn collect_definitions_in_suite(
@@ -577,11 +809,23 @@ fn collect_definitions_in_suite(
                 class_def,
                 class_stack,
             ),
-            Stmt::FunctionDef(function_def) if class_stack.is_empty() => {
-                collect_function(index, source_file, module_path, python_module, function_def)
-            }
+            Stmt::FunctionDef(function_def) if class_stack.is_empty() => collect_function(
+                index,
+                source_file,
+                module_path,
+                python_module,
+                import_index,
+                function_def,
+            ),
             Stmt::AsyncFunctionDef(function_def) if class_stack.is_empty() => {
-                collect_async_function(index, source_file, module_path, python_module, function_def)
+                collect_async_function(
+                    index,
+                    source_file,
+                    module_path,
+                    python_module,
+                    import_index,
+                    function_def,
+                )
             }
             _ => {}
         }
@@ -607,6 +851,8 @@ fn collect_class(
         .filter_map(|base| expr_model_reference(base, import_index))
         .collect();
     let relationships = collect_relationships(&class_def.body, import_index);
+    let data_model = collect_meta_model_reference(&class_def.body, import_index);
+    let references = collect_symbol_references(&class_def.body, import_index, python_module);
 
     index.add_class(ClassSymbol {
         source_file,
@@ -616,14 +862,17 @@ fn collect_class(
         python_qualified_name: python_qualified_name.clone(),
         bases,
         relationships,
+        data_model,
         app: infer_django_app(module_path),
     });
 
     index.add_view(ViewSymbol {
         source_file,
         module_path: module_path.to_owned(),
+        python_module: python_module.to_owned(),
         qualified_name: qualified_name.clone(),
         python_qualified_name,
+        references,
     });
 
     collect_definitions_in_suite(
@@ -644,6 +893,7 @@ fn collect_function(
     source_file: Option<NodeIndex>,
     module_path: &str,
     python_module: &str,
+    import_index: &ImportIndex,
     function_def: &StmtFunctionDef,
 ) {
     collect_view_function(
@@ -651,7 +901,9 @@ fn collect_function(
         source_file,
         module_path,
         python_module,
+        import_index,
         function_def.name.as_str(),
+        &function_def.body,
     );
 }
 
@@ -660,6 +912,7 @@ fn collect_async_function(
     source_file: Option<NodeIndex>,
     module_path: &str,
     python_module: &str,
+    import_index: &ImportIndex,
     function_def: &StmtAsyncFunctionDef,
 ) {
     collect_view_function(
@@ -667,7 +920,9 @@ fn collect_async_function(
         source_file,
         module_path,
         python_module,
+        import_index,
         function_def.name.as_str(),
+        &function_def.body,
     );
 }
 
@@ -676,13 +931,17 @@ fn collect_view_function(
     source_file: Option<NodeIndex>,
     module_path: &str,
     python_module: &str,
+    import_index: &ImportIndex,
     name: &str,
+    body: &ast::Suite,
 ) {
     index.add_view(ViewSymbol {
         source_file,
         module_path: module_path.to_owned(),
+        python_module: python_module.to_owned(),
         qualified_name: name.to_owned(),
         python_qualified_name: format!("{python_module}.{name}"),
+        references: collect_symbol_references(body, import_index, python_module),
     });
 }
 
@@ -1029,6 +1288,860 @@ fn combine_route_patterns(prefix: &str, route: &str) -> String {
         (_, true) => prefix.to_owned(),
         _ => format!("{prefix}{route}"),
     }
+}
+
+fn collect_meta_model_reference(
+    suite: &ast::Suite,
+    import_index: &ImportIndex,
+) -> Option<ModelReference> {
+    suite.iter().find_map(|statement| {
+        let Stmt::ClassDef(class_def) = statement else {
+            return None;
+        };
+
+        if class_def.name.as_str() != "Meta" {
+            return None;
+        }
+
+        class_def.body.iter().find_map(|statement| match statement {
+            Stmt::Assign(assign) if assign.targets.iter().any(is_model_meta_target) => {
+                expr_model_reference(&assign.value, import_index)
+            }
+            Stmt::AnnAssign(assign) if is_model_meta_target(&assign.target) => assign
+                .value
+                .as_deref()
+                .and_then(|value| expr_model_reference(value, import_index)),
+            _ => None,
+        })
+    })
+}
+
+fn is_model_meta_target(expr: &Expr) -> bool {
+    matches!(expr, Expr::Name(name) if name.id.as_str() == "model")
+}
+
+fn collect_symbol_references(
+    suite: &ast::Suite,
+    import_index: &ImportIndex,
+    python_module: &str,
+) -> SymbolReferences {
+    let mut references = SymbolReferences::default();
+
+    for statement in suite {
+        collect_symbol_references_from_stmt(
+            &mut references,
+            statement,
+            import_index,
+            python_module,
+        );
+    }
+
+    references
+}
+
+fn collect_symbol_references_from_stmt(
+    references: &mut SymbolReferences,
+    statement: &Stmt,
+    import_index: &ImportIndex,
+    python_module: &str,
+) {
+    match statement {
+        Stmt::FunctionDef(function_def) => {
+            for decorator in &function_def.decorator_list {
+                collect_symbol_references_from_expr(
+                    references,
+                    decorator,
+                    import_index,
+                    python_module,
+                );
+            }
+
+            if let Some(returns) = &function_def.returns {
+                collect_symbol_references_from_expr(
+                    references,
+                    returns,
+                    import_index,
+                    python_module,
+                );
+            }
+
+            collect_symbol_references_from_suite(
+                references,
+                &function_def.body,
+                import_index,
+                python_module,
+            );
+        }
+        Stmt::AsyncFunctionDef(function_def) => {
+            for decorator in &function_def.decorator_list {
+                collect_symbol_references_from_expr(
+                    references,
+                    decorator,
+                    import_index,
+                    python_module,
+                );
+            }
+
+            if let Some(returns) = &function_def.returns {
+                collect_symbol_references_from_expr(
+                    references,
+                    returns,
+                    import_index,
+                    python_module,
+                );
+            }
+
+            collect_symbol_references_from_suite(
+                references,
+                &function_def.body,
+                import_index,
+                python_module,
+            );
+        }
+        Stmt::ClassDef(class_def) => {
+            for base in &class_def.bases {
+                collect_symbol_references_from_expr(references, base, import_index, python_module);
+            }
+
+            for keyword in &class_def.keywords {
+                collect_symbol_references_from_expr(
+                    references,
+                    &keyword.value,
+                    import_index,
+                    python_module,
+                );
+            }
+
+            for decorator in &class_def.decorator_list {
+                collect_symbol_references_from_expr(
+                    references,
+                    decorator,
+                    import_index,
+                    python_module,
+                );
+            }
+
+            collect_symbol_references_from_suite(
+                references,
+                &class_def.body,
+                import_index,
+                python_module,
+            );
+        }
+        Stmt::Return(statement) => {
+            if let Some(value) = &statement.value {
+                collect_symbol_references_from_expr(references, value, import_index, python_module);
+            }
+        }
+        Stmt::Assign(statement) => {
+            for target in &statement.targets {
+                collect_symbol_references_from_expr(
+                    references,
+                    target,
+                    import_index,
+                    python_module,
+                );
+            }
+
+            collect_symbol_references_from_expr(
+                references,
+                &statement.value,
+                import_index,
+                python_module,
+            );
+        }
+        Stmt::AugAssign(statement) => {
+            collect_symbol_references_from_expr(
+                references,
+                &statement.target,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_expr(
+                references,
+                &statement.value,
+                import_index,
+                python_module,
+            );
+        }
+        Stmt::AnnAssign(statement) => {
+            collect_symbol_references_from_expr(
+                references,
+                &statement.target,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_expr(
+                references,
+                &statement.annotation,
+                import_index,
+                python_module,
+            );
+
+            if let Some(value) = &statement.value {
+                collect_symbol_references_from_expr(references, value, import_index, python_module);
+            }
+        }
+        Stmt::For(statement) => {
+            collect_symbol_references_from_expr(
+                references,
+                &statement.target,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_expr(
+                references,
+                &statement.iter,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_suite(
+                references,
+                &statement.body,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_suite(
+                references,
+                &statement.orelse,
+                import_index,
+                python_module,
+            );
+        }
+        Stmt::AsyncFor(statement) => {
+            collect_symbol_references_from_expr(
+                references,
+                &statement.target,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_expr(
+                references,
+                &statement.iter,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_suite(
+                references,
+                &statement.body,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_suite(
+                references,
+                &statement.orelse,
+                import_index,
+                python_module,
+            );
+        }
+        Stmt::While(statement) => {
+            collect_symbol_references_from_expr(
+                references,
+                &statement.test,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_suite(
+                references,
+                &statement.body,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_suite(
+                references,
+                &statement.orelse,
+                import_index,
+                python_module,
+            );
+        }
+        Stmt::If(statement) => {
+            collect_symbol_references_from_expr(
+                references,
+                &statement.test,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_suite(
+                references,
+                &statement.body,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_suite(
+                references,
+                &statement.orelse,
+                import_index,
+                python_module,
+            );
+        }
+        Stmt::With(statement) => {
+            for item in &statement.items {
+                collect_symbol_references_from_with_item(
+                    references,
+                    item,
+                    import_index,
+                    python_module,
+                );
+            }
+
+            collect_symbol_references_from_suite(
+                references,
+                &statement.body,
+                import_index,
+                python_module,
+            );
+        }
+        Stmt::AsyncWith(statement) => {
+            for item in &statement.items {
+                collect_symbol_references_from_with_item(
+                    references,
+                    item,
+                    import_index,
+                    python_module,
+                );
+            }
+
+            collect_symbol_references_from_suite(
+                references,
+                &statement.body,
+                import_index,
+                python_module,
+            );
+        }
+        Stmt::Try(statement) => {
+            collect_symbol_references_from_suite(
+                references,
+                &statement.body,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_handlers(
+                references,
+                &statement.handlers,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_suite(
+                references,
+                &statement.orelse,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_suite(
+                references,
+                &statement.finalbody,
+                import_index,
+                python_module,
+            );
+        }
+        Stmt::TryStar(statement) => {
+            collect_symbol_references_from_suite(
+                references,
+                &statement.body,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_handlers(
+                references,
+                &statement.handlers,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_suite(
+                references,
+                &statement.orelse,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_suite(
+                references,
+                &statement.finalbody,
+                import_index,
+                python_module,
+            );
+        }
+        Stmt::Raise(statement) => {
+            if let Some(exc) = &statement.exc {
+                collect_symbol_references_from_expr(references, exc, import_index, python_module);
+            }
+
+            if let Some(cause) = &statement.cause {
+                collect_symbol_references_from_expr(references, cause, import_index, python_module);
+            }
+        }
+        Stmt::Assert(statement) => {
+            collect_symbol_references_from_expr(
+                references,
+                &statement.test,
+                import_index,
+                python_module,
+            );
+
+            if let Some(message) = &statement.msg {
+                collect_symbol_references_from_expr(
+                    references,
+                    message,
+                    import_index,
+                    python_module,
+                );
+            }
+        }
+        Stmt::Expr(statement) => {
+            collect_symbol_references_from_expr(
+                references,
+                &statement.value,
+                import_index,
+                python_module,
+            );
+        }
+        Stmt::Delete(statement) => {
+            for target in &statement.targets {
+                collect_symbol_references_from_expr(
+                    references,
+                    target,
+                    import_index,
+                    python_module,
+                );
+            }
+        }
+        Stmt::TypeAlias(statement) => {
+            collect_symbol_references_from_expr(
+                references,
+                &statement.name,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_expr(
+                references,
+                &statement.value,
+                import_index,
+                python_module,
+            );
+        }
+        Stmt::Import(_)
+        | Stmt::ImportFrom(_)
+        | Stmt::Global(_)
+        | Stmt::Nonlocal(_)
+        | Stmt::Pass(_)
+        | Stmt::Break(_)
+        | Stmt::Continue(_)
+        | Stmt::Match(_) => {}
+    }
+}
+
+fn collect_symbol_references_from_suite(
+    references: &mut SymbolReferences,
+    suite: &ast::Suite,
+    import_index: &ImportIndex,
+    python_module: &str,
+) {
+    for statement in suite {
+        collect_symbol_references_from_stmt(references, statement, import_index, python_module);
+    }
+}
+
+fn collect_symbol_references_from_with_item(
+    references: &mut SymbolReferences,
+    item: &ast::WithItem,
+    import_index: &ImportIndex,
+    python_module: &str,
+) {
+    collect_symbol_references_from_expr(
+        references,
+        &item.context_expr,
+        import_index,
+        python_module,
+    );
+
+    if let Some(optional_vars) = &item.optional_vars {
+        collect_symbol_references_from_expr(references, optional_vars, import_index, python_module);
+    }
+}
+
+fn collect_symbol_references_from_handlers(
+    references: &mut SymbolReferences,
+    handlers: &[ast::ExceptHandler],
+    import_index: &ImportIndex,
+    python_module: &str,
+) {
+    for handler in handlers {
+        let ast::ExceptHandler::ExceptHandler(handler) = handler;
+
+        if let Some(handler_type) = &handler.type_ {
+            collect_symbol_references_from_expr(
+                references,
+                handler_type,
+                import_index,
+                python_module,
+            );
+        }
+
+        collect_symbol_references_from_suite(
+            references,
+            &handler.body,
+            import_index,
+            python_module,
+        );
+    }
+}
+
+fn collect_symbol_references_from_expr(
+    references: &mut SymbolReferences,
+    expr: &Expr,
+    import_index: &ImportIndex,
+    python_module: &str,
+) {
+    if let Some(name) = expr_dotted_name(expr) {
+        references.add(resolve_symbol_reference(&name, import_index, python_module));
+    }
+
+    match expr {
+        Expr::BoolOp(expr) => {
+            for value in &expr.values {
+                collect_symbol_references_from_expr(references, value, import_index, python_module);
+            }
+        }
+        Expr::NamedExpr(expr) => {
+            collect_symbol_references_from_expr(
+                references,
+                &expr.target,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_expr(
+                references,
+                &expr.value,
+                import_index,
+                python_module,
+            );
+        }
+        Expr::BinOp(expr) => {
+            collect_symbol_references_from_expr(
+                references,
+                &expr.left,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_expr(
+                references,
+                &expr.right,
+                import_index,
+                python_module,
+            );
+        }
+        Expr::UnaryOp(expr) => {
+            collect_symbol_references_from_expr(
+                references,
+                &expr.operand,
+                import_index,
+                python_module,
+            );
+        }
+        Expr::Lambda(expr) => {
+            collect_symbol_references_from_expr(
+                references,
+                &expr.body,
+                import_index,
+                python_module,
+            );
+        }
+        Expr::IfExp(expr) => {
+            collect_symbol_references_from_expr(
+                references,
+                &expr.test,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_expr(
+                references,
+                &expr.body,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_expr(
+                references,
+                &expr.orelse,
+                import_index,
+                python_module,
+            );
+        }
+        Expr::Dict(expr) => {
+            for key in expr.keys.iter().flatten() {
+                collect_symbol_references_from_expr(references, key, import_index, python_module);
+            }
+
+            for value in &expr.values {
+                collect_symbol_references_from_expr(references, value, import_index, python_module);
+            }
+        }
+        Expr::Set(expr) => {
+            for element in &expr.elts {
+                collect_symbol_references_from_expr(
+                    references,
+                    element,
+                    import_index,
+                    python_module,
+                );
+            }
+        }
+        Expr::ListComp(expr) => {
+            collect_symbol_references_from_expr(references, &expr.elt, import_index, python_module);
+            collect_symbol_references_from_comprehensions(
+                references,
+                &expr.generators,
+                import_index,
+                python_module,
+            );
+        }
+        Expr::SetComp(expr) => {
+            collect_symbol_references_from_expr(references, &expr.elt, import_index, python_module);
+            collect_symbol_references_from_comprehensions(
+                references,
+                &expr.generators,
+                import_index,
+                python_module,
+            );
+        }
+        Expr::DictComp(expr) => {
+            collect_symbol_references_from_expr(references, &expr.key, import_index, python_module);
+            collect_symbol_references_from_expr(
+                references,
+                &expr.value,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_comprehensions(
+                references,
+                &expr.generators,
+                import_index,
+                python_module,
+            );
+        }
+        Expr::GeneratorExp(expr) => {
+            collect_symbol_references_from_expr(references, &expr.elt, import_index, python_module);
+            collect_symbol_references_from_comprehensions(
+                references,
+                &expr.generators,
+                import_index,
+                python_module,
+            );
+        }
+        Expr::Await(expr) => {
+            collect_symbol_references_from_expr(
+                references,
+                &expr.value,
+                import_index,
+                python_module,
+            );
+        }
+        Expr::Yield(expr) => {
+            if let Some(value) = &expr.value {
+                collect_symbol_references_from_expr(references, value, import_index, python_module);
+            }
+        }
+        Expr::YieldFrom(expr) => {
+            collect_symbol_references_from_expr(
+                references,
+                &expr.value,
+                import_index,
+                python_module,
+            );
+        }
+        Expr::Compare(expr) => {
+            collect_symbol_references_from_expr(
+                references,
+                &expr.left,
+                import_index,
+                python_module,
+            );
+
+            for comparator in &expr.comparators {
+                collect_symbol_references_from_expr(
+                    references,
+                    comparator,
+                    import_index,
+                    python_module,
+                );
+            }
+        }
+        Expr::Call(expr) => {
+            collect_symbol_references_from_expr(
+                references,
+                &expr.func,
+                import_index,
+                python_module,
+            );
+
+            for arg in &expr.args {
+                collect_symbol_references_from_expr(references, arg, import_index, python_module);
+            }
+
+            for keyword in &expr.keywords {
+                collect_symbol_references_from_expr(
+                    references,
+                    &keyword.value,
+                    import_index,
+                    python_module,
+                );
+            }
+        }
+        Expr::FormattedValue(expr) => {
+            collect_symbol_references_from_expr(
+                references,
+                &expr.value,
+                import_index,
+                python_module,
+            );
+
+            if let Some(format_spec) = &expr.format_spec {
+                collect_symbol_references_from_expr(
+                    references,
+                    format_spec,
+                    import_index,
+                    python_module,
+                );
+            }
+        }
+        Expr::JoinedStr(expr) => {
+            for value in &expr.values {
+                collect_symbol_references_from_expr(references, value, import_index, python_module);
+            }
+        }
+        Expr::Attribute(expr) => {
+            collect_symbol_references_from_expr(
+                references,
+                &expr.value,
+                import_index,
+                python_module,
+            );
+        }
+        Expr::Subscript(expr) => {
+            collect_symbol_references_from_expr(
+                references,
+                &expr.value,
+                import_index,
+                python_module,
+            );
+            collect_symbol_references_from_expr(
+                references,
+                &expr.slice,
+                import_index,
+                python_module,
+            );
+        }
+        Expr::Starred(expr) => {
+            collect_symbol_references_from_expr(
+                references,
+                &expr.value,
+                import_index,
+                python_module,
+            );
+        }
+        Expr::List(expr) => {
+            for element in &expr.elts {
+                collect_symbol_references_from_expr(
+                    references,
+                    element,
+                    import_index,
+                    python_module,
+                );
+            }
+        }
+        Expr::Tuple(expr) => {
+            for element in &expr.elts {
+                collect_symbol_references_from_expr(
+                    references,
+                    element,
+                    import_index,
+                    python_module,
+                );
+            }
+        }
+        Expr::Slice(expr) => {
+            if let Some(lower) = &expr.lower {
+                collect_symbol_references_from_expr(references, lower, import_index, python_module);
+            }
+
+            if let Some(upper) = &expr.upper {
+                collect_symbol_references_from_expr(references, upper, import_index, python_module);
+            }
+
+            if let Some(step) = &expr.step {
+                collect_symbol_references_from_expr(references, step, import_index, python_module);
+            }
+        }
+        Expr::Constant(_) | Expr::Name(_) => {}
+    }
+}
+
+fn collect_symbol_references_from_comprehensions(
+    references: &mut SymbolReferences,
+    comprehensions: &[ast::Comprehension],
+    import_index: &ImportIndex,
+    python_module: &str,
+) {
+    for comprehension in comprehensions {
+        collect_symbol_references_from_expr(
+            references,
+            &comprehension.target,
+            import_index,
+            python_module,
+        );
+        collect_symbol_references_from_expr(
+            references,
+            &comprehension.iter,
+            import_index,
+            python_module,
+        );
+
+        for condition in &comprehension.ifs {
+            collect_symbol_references_from_expr(references, condition, import_index, python_module);
+        }
+    }
+}
+
+fn resolve_symbol_reference(
+    dotted_name: &str,
+    import_index: &ImportIndex,
+    python_module: &str,
+) -> String {
+    let resolved = import_index.resolve(dotted_name);
+
+    if resolved == dotted_name && !dotted_name.contains('.') {
+        format!("{python_module}.{dotted_name}")
+    } else {
+        resolved
+    }
+}
+
+fn direct_data_layer_kind(value: &str) -> Option<DataLayerKind> {
+    match value {
+        "rest_framework.serializers.ModelSerializer"
+        | "rest_framework.serializers.HyperlinkedModelSerializer"
+        | "rest_framework.serializers.Serializer" => Some(DataLayerKind::Serializer),
+        "django.forms.ModelForm"
+        | "django.forms.Form"
+        | "django.forms.models.ModelForm"
+        | "django.forms.forms.Form" => Some(DataLayerKind::Form),
+        _ => None,
+    }
+}
+
+fn reference_prefixes(reference: &str) -> Vec<&str> {
+    let mut prefixes = Vec::new();
+    let mut candidate = reference;
+
+    loop {
+        prefixes.push(candidate);
+
+        let Some((prefix, _)) = candidate.rsplit_once('.') else {
+            break;
+        };
+
+        candidate = prefix;
+    }
+
+    prefixes
 }
 
 fn collect_relationships(suite: &ast::Suite, import_index: &ImportIndex) -> Vec<ModelRelationship> {
@@ -1633,5 +2746,152 @@ class ProductViewSet:
                 .iter()
                 .any(|node| node.node_type == NodeType::Url && node.label == "products/")
         );
+    }
+
+    #[test]
+    fn maps_routed_viewsets_through_serializers_to_models() {
+        let project = TempProject::new("django-view-serializer-data-flow");
+        let models = project.write(
+            "shop/models.py",
+            r#"
+from django.db import models
+
+class Product(models.Model):
+    pass
+"#,
+        );
+        let serializers = project.write(
+            "shop/serializers.py",
+            r#"
+from rest_framework import serializers
+from .models import Product
+
+class ProductSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Product
+        fields = ["id"]
+"#,
+        );
+        let views = project.write(
+            "shop/views.py",
+            r#"
+from .models import Product
+from .serializers import ProductSerializer
+
+class ProductViewSet:
+    serializer_class = ProductSerializer
+    queryset = Product.objects.all()
+"#,
+        );
+        let urls = project.write(
+            "shop/urls.py",
+            r#"
+from rest_framework.routers import DefaultRouter
+from .views import ProductViewSet
+
+router = DefaultRouter()
+router.register("products", ProductViewSet, basename="product")
+
+urlpatterns = router.urls
+"#,
+        );
+        let files = vec![models, serializers, views, urls];
+        let report = parse_python_files(&files);
+
+        assert!(!report.has_diagnostics());
+
+        let graph = analyze_python_project(&project.path, &files, &report.modules);
+
+        assert_eq!(graph.node_count_by_type(NodeType::Model), 1);
+        assert_eq!(graph.node_count_by_type(NodeType::Url), 1);
+        assert_eq!(graph.node_count_by_type(NodeType::View), 1);
+        assert_eq!(graph.node_count_by_type(NodeType::Serializer), 1);
+        assert_eq!(graph.edge_count_by_type(EdgeType::RoutesTo), 1);
+        assert_eq!(graph.edge_count_by_type(EdgeType::Serializes), 2);
+        assert_eq!(graph.edge_count_by_type(EdgeType::Queries), 1);
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "view:shop.views.ProductViewSet"
+                && edge.target == "serializer:shop.serializers.ProductSerializer"
+                && edge.edge_type == EdgeType::Serializes
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "serializer:shop.serializers.ProductSerializer"
+                && edge.target == "model:shop/models.py:Product"
+                && edge.edge_type == EdgeType::Serializes
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "view:shop.views.ProductViewSet"
+                && edge.target == "model:shop/models.py:Product"
+                && edge.edge_type == EdgeType::Queries
+        }));
+    }
+
+    #[test]
+    fn maps_function_views_through_forms_to_models() {
+        let project = TempProject::new("django-view-form-data-flow");
+        let models = project.write(
+            "shop/models.py",
+            r#"
+from django.db import models
+
+class Product(models.Model):
+    pass
+"#,
+        );
+        let forms = project.write(
+            "shop/forms.py",
+            r#"
+from django import forms
+from .models import Product
+
+class ProductForm(forms.ModelForm):
+    class Meta:
+        model = Product
+        fields = ["id"]
+"#,
+        );
+        let views = project.write(
+            "shop/views.py",
+            r#"
+from .forms import ProductForm
+from .models import Product
+
+def product_create(request):
+    form = ProductForm(request.POST)
+    Product.objects.create()
+    return form
+"#,
+        );
+        let urls = project.write(
+            "shop/urls.py",
+            r#"
+from django.urls import path
+from .views import product_create
+
+urlpatterns = [
+    path("products/new/", product_create, name="product-create"),
+]
+"#,
+        );
+        let files = vec![models, forms, views, urls];
+        let report = parse_python_files(&files);
+
+        assert!(!report.has_diagnostics());
+
+        let graph = analyze_python_project(&project.path, &files, &report.modules);
+
+        assert_eq!(graph.node_count_by_type(NodeType::Form), 1);
+        assert_eq!(graph.edge_count_by_type(EdgeType::Serializes), 2);
+        assert_eq!(graph.edge_count_by_type(EdgeType::Queries), 1);
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "view:shop.views.product_create"
+                && edge.target == "form:shop.forms.ProductForm"
+                && edge.edge_type == EdgeType::Serializes
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.source == "form:shop.forms.ProductForm"
+                && edge.target == "model:shop/models.py:Product"
+                && edge.edge_type == EdgeType::Serializes
+        }));
     }
 }

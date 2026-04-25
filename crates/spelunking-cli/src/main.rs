@@ -93,6 +93,11 @@ fn print_summary(
     println!("Django URLs: {}", graph.node_count_by_type(NodeType::Url));
     println!("Django views: {}", graph.node_count_by_type(NodeType::View));
     println!(
+        "Django serializers: {}",
+        graph.node_count_by_type(NodeType::Serializer)
+    );
+    println!("Django forms: {}", graph.node_count_by_type(NodeType::Form));
+    println!(
         "Model inheritance edges: {}",
         graph.edge_count_by_type(EdgeType::Inherits)
     );
@@ -103,6 +108,14 @@ fn print_summary(
     println!(
         "URL route edges: {}",
         graph.edge_count_by_type(EdgeType::RoutesTo)
+    );
+    println!(
+        "Serialization edges: {}",
+        graph.edge_count_by_type(EdgeType::Serializes)
+    );
+    println!(
+        "Query edges: {}",
+        graph.edge_count_by_type(EdgeType::Queries)
     );
 
     if cli.list_files {
