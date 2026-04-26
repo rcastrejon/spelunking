@@ -108,6 +108,10 @@ pub use super::behavior::{
     DjangoBehaviorPath, DjangoBehaviorReport, DjangoBehaviorStep, DjangoMutationSite,
     inspect_django_behavior,
 };
+pub use super::guidance::{
+    DjangoCouplingSignal, DjangoGuidanceReport, DjangoOpenQuestion, DjangoReadingPathEntry,
+    DjangoRelatedTest, DjangoRiskSignal, inspect_django_guidance,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DjangoSubjectCandidate {
@@ -2303,6 +2307,176 @@ def mark_cancelled(modeladmin, request, queryset):
                 .iter()
                 .any(|path| path.kind == "async_path"
                     && path.steps.iter().any(|step| step.kind == "task"))
+        );
+    }
+
+    #[test]
+    fn inspects_django_guidance_risks_questions_tests_and_reading_path() {
+        let project = TempProject::new("guidance");
+        let models = project.write(
+            "reservations/models.py",
+            r#"
+from django.db import models
+
+class Reservation(models.Model):
+    PENDING = "pending"
+    CANCELLED = "cancelled"
+    CONFIRMED = "confirmed"
+    STATUS_CHOICES = (
+        (PENDING, "Pending"),
+        (CANCELLED, "Cancelled"),
+        (CONFIRMED, "Confirmed"),
+    )
+
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=PENDING)
+
+    def cancel(self):
+        self.status = self.CANCELLED
+"#,
+        );
+        let serializers = project.write(
+            "reservations/serializers.py",
+            r#"
+from rest_framework import serializers
+from .models import Reservation
+
+class ReservationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Reservation
+        fields = ["id", "status"]
+"#,
+        );
+        let views = project.write(
+            "reservations/views.py",
+            r#"
+from rest_framework.viewsets import ModelViewSet
+from .models import Reservation
+from .serializers import ReservationSerializer
+
+class ReservationViewSet(ModelViewSet):
+    serializer_class = ReservationSerializer
+
+    def cancel(self, request, pk=None):
+        reservation = Reservation.objects.get(pk=pk)
+        reservation.status = Reservation.CANCELLED
+        reservation.save()
+"#,
+        );
+        let urls = project.write(
+            "reservations/urls.py",
+            r#"
+from django.urls import path
+from .views import ReservationViewSet
+
+urlpatterns = [
+    path("reservations/<int:pk>/cancel/", ReservationViewSet.as_view({"post": "cancel"})),
+]
+"#,
+        );
+        let tasks = project.write(
+            "reservations/tasks.py",
+            r#"
+from celery import shared_task
+from .models import Reservation
+
+@shared_task
+def expire_pending_reservations():
+    Reservation.objects.filter(status=Reservation.PENDING).update(status=Reservation.CANCELLED)
+"#,
+        );
+        let admin = project.write(
+            "reservations/admin.py",
+            r#"
+from django.contrib import admin
+from .models import Reservation
+
+@admin.action(description="Cancel reservations")
+def mark_cancelled(modeladmin, request, queryset):
+    queryset.update(status=Reservation.CANCELLED)
+"#,
+        );
+        let webhooks = project.write(
+            "payments/webhooks.py",
+            r#"
+from reservations.models import Reservation
+
+def payment_webhook(request):
+    reservation = Reservation.objects.get(pk=request.POST["reservation_id"])
+    reservation.status = Reservation.CONFIRMED
+    reservation.save()
+"#,
+        );
+        let cancellation_tests = project.write(
+            "reservations/tests/test_cancellation.py",
+            r#"
+from reservations.models import Reservation
+
+def test_cancel_sets_status(db):
+    reservation = Reservation.objects.create(status=Reservation.PENDING)
+    reservation.cancel()
+    assert reservation.status == Reservation.CANCELLED
+"#,
+        );
+        let webhook_tests = project.write(
+            "payments/tests/test_webhooks.py",
+            r#"
+from reservations.models import Reservation
+
+def test_payment_confirms_reservation(db):
+    reservation = Reservation.objects.create(status=Reservation.PENDING)
+    assert reservation.status != Reservation.CONFIRMED
+"#,
+        );
+        let report = parse_python_files(&[
+            models,
+            serializers,
+            views,
+            urls,
+            tasks,
+            admin,
+            webhooks,
+            cancellation_tests,
+            webhook_tests,
+        ]);
+        let guidance =
+            inspect_django_guidance(&project.path, &report.modules, "Reservation.status")
+                .expect("guidance inspection should succeed");
+
+        assert!(guidance.risks.iter().any(|risk| {
+            risk.title == "Distributed lifecycle ownership" && risk.severity == "high"
+        }));
+        assert!(
+            guidance
+                .risks
+                .iter()
+                .any(|risk| risk.title == "Admin bypass risk")
+        );
+        assert!(guidance.open_questions.iter().any(|question| {
+            question
+                .question
+                .contains("Which module should own valid transitions")
+        }));
+        assert!(guidance.related_tests.iter().any(|test| {
+            test.path == "reservations/tests/test_cancellation.py" && test.confidence == "high"
+        }));
+        assert!(
+            guidance
+                .coupling_signals
+                .iter()
+                .any(|signal| signal.kind == "cross_app_mutation")
+        );
+        assert_eq!(
+            guidance
+                .reading_path
+                .first()
+                .map(|entry| entry.path.as_str()),
+            Some("reservations/models.py")
+        );
+        assert!(
+            guidance
+                .reading_path
+                .iter()
+                .any(|entry| entry.path == "payments/webhooks.py")
         );
     }
 }

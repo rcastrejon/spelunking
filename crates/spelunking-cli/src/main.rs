@@ -1,10 +1,10 @@
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use spelunking_core::{
-    DjangoBehaviorReport, DjangoSubjectReport, Edge, EdgeType, GraphExport, GraphFilter, Node,
-    NodeType, PythonParseDiagnostic, PythonParseReport, analyze_python_project,
-    discover_python_files, inspect_django_behavior, inspect_django_subject, parse_python_files,
-    relative_path_identifier,
+    DjangoBehaviorReport, DjangoGuidanceReport, DjangoSubjectReport, Edge, EdgeType, GraphExport,
+    GraphFilter, Node, NodeType, PythonParseDiagnostic, PythonParseReport, analyze_python_project,
+    discover_python_files, inspect_django_behavior, inspect_django_guidance,
+    inspect_django_subject, parse_python_files, relative_path_identifier,
 };
 use std::{
     collections::HashSet,
@@ -45,6 +45,10 @@ struct Cli {
     #[arg(long = "inspect-behavior", value_name = "MODEL.FIELD")]
     inspect_behavior: Option<String>,
 
+    /// Inspect operational risks, open questions, reading path, and related tests for a Django model field.
+    #[arg(long = "inspect-guidance", value_name = "MODEL.FIELD")]
+    inspect_guidance: Option<String>,
+
     /// Include only these node types. Repeat the flag or use comma-separated values.
     #[arg(long = "node-type", value_name = "TYPE", value_parser = parse_node_type, value_delimiter = ',')]
     node_types: Vec<NodeType>,
@@ -84,10 +88,19 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    if cli.inspect_subject.is_some() && cli.inspect_behavior.is_some() {
+    let inspect_modes = [
+        cli.inspect_subject.is_some(),
+        cli.inspect_behavior.is_some(),
+        cli.inspect_guidance.is_some(),
+    ]
+    .into_iter()
+    .filter(|enabled| *enabled)
+    .count();
+
+    if inspect_modes > 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--inspect-subject and --inspect-behavior cannot be used together",
+            "--inspect-subject, --inspect-behavior, and --inspect-guidance cannot be used together",
         )
         .into());
     }
@@ -96,7 +109,21 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let parse_report = parse_python_files(&python_files);
     let mut output = output_writer(cli.output.as_deref())?;
 
-    if let Some(subject) = &cli.inspect_behavior {
+    if let Some(subject) = &cli.inspect_guidance {
+        let report = inspect_django_guidance(&cli.target, &parse_report.modules, subject)?;
+
+        match cli.format {
+            OutputFormat::Summary => write_guidance_summary(&mut output, &report)?,
+            OutputFormat::Json => write_guidance_json(&mut output, &report)?,
+            OutputFormat::Dot => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--inspect-guidance supports --format summary or --format json",
+                )
+                .into());
+            }
+        }
+    } else if let Some(subject) = &cli.inspect_behavior {
         let report = inspect_django_behavior(&cli.target, &parse_report.modules, subject)?;
 
         match cli.format {
@@ -347,6 +374,90 @@ fn write_behavior_summary(output: &mut dyn Write, report: &DjangoBehaviorReport)
 fn write_behavior_json(
     output: &mut dyn Write,
     report: &DjangoBehaviorReport,
+) -> Result<(), serde_json::Error> {
+    serde_json::to_writer_pretty(&mut *output, report)?;
+    writeln!(output).map_err(serde_json::Error::io)
+}
+
+fn write_guidance_summary(output: &mut dyn Write, report: &DjangoGuidanceReport) -> io::Result<()> {
+    writeln!(output, "Guidance for {}", report.subject)?;
+
+    writeln!(output)?;
+    writeln!(output, "Risks:")?;
+    write_limited_items(output, &report.risks, 10, |output, risk| {
+        writeln!(
+            output,
+            "- {} ({}, {})",
+            risk.title, risk.severity, risk.confidence
+        )?;
+        writeln!(output, "  {}", risk.description)?;
+
+        for evidence in risk.evidence.iter().take(3) {
+            writeln!(
+                output,
+                "  Evidence: {}:{} {}",
+                evidence.path, evidence.line, evidence.detail
+            )?;
+        }
+
+        Ok(())
+    })?;
+
+    writeln!(output)?;
+    writeln!(output, "Open questions:")?;
+    write_limited_items(output, &report.open_questions, 8, |output, question| {
+        writeln!(output, "- {}", question.question)?;
+        writeln!(output, "  {}", question.reason)
+    })?;
+
+    writeln!(output)?;
+    writeln!(output, "Coupling signals:")?;
+    write_limited_items(output, &report.coupling_signals, 8, |output, signal| {
+        writeln!(
+            output,
+            "- {} ({}) - {}",
+            signal.kind, signal.confidence, signal.description
+        )
+    })?;
+
+    writeln!(output)?;
+    writeln!(output, "Recommended reading path:")?;
+    write_limited_items(output, &report.reading_path, 10, |output, entry| {
+        writeln!(
+            output,
+            "{}. {}:{} ({})",
+            entry.priority, entry.path, entry.line, entry.confidence
+        )?;
+        writeln!(output, "   {}", entry.reason)
+    })?;
+
+    writeln!(output)?;
+    writeln!(output, "Related tests:")?;
+    write_limited_items(output, &report.related_tests, 8, |output, test| {
+        writeln!(
+            output,
+            "- {}:{} ({}) - {}",
+            test.path, test.line, test.confidence, test.reason
+        )
+    })?;
+
+    writeln!(output)?;
+    writeln!(output, "Evidence:")?;
+    write_limited_items(output, &report.evidence, 20, |output, evidence| {
+        writeln!(
+            output,
+            "- {}:{} {}",
+            evidence.path, evidence.line, evidence.detail
+        )
+    })?;
+
+    writeln!(output)?;
+    writeln!(output, "Confidence: {}", report.confidence)
+}
+
+fn write_guidance_json(
+    output: &mut dyn Write,
+    report: &DjangoGuidanceReport,
 ) -> Result<(), serde_json::Error> {
     serde_json::to_writer_pretty(&mut *output, report)?;
     writeln!(output).map_err(serde_json::Error::io)

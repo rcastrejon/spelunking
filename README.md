@@ -39,6 +39,12 @@ Inspect behavior for the same subject to find mutation sites and approximate pat
 cargo run -p spelunking-cli -- /path/to/django-project --inspect-behavior reservations.Reservation.status
 ```
 
+Generate operational guidance for the subject to highlight risk signals, open questions, coupling across apps/layers, related tests, and a short recommended reading path:
+
+```sh
+cargo run -p spelunking-cli -- /path/to/django-project --inspect-guidance reservations.Reservation.status
+```
+
 The CLI can also emit the current graph contract as versioned JSON. The export includes summary counts, filters, parse/read diagnostics, and the graph itself. The graph contains source-file, Django app, model, URL, view, serializer, form, service, middleware, context processor, signal, signal handler, and task nodes, plus containment, call, inheritance, direct ORM relationship, URL routing, serialization, query, global hook intercept, and trigger edges:
 
 ```sh
