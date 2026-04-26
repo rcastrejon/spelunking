@@ -383,6 +383,40 @@ fn write_guidance_summary(output: &mut dyn Write, report: &DjangoGuidanceReport)
     writeln!(output, "Guidance for {}", report.subject)?;
 
     writeln!(output)?;
+    writeln!(output, "Analysis basis:")?;
+    writeln!(output, "- Scope: {}", report.analysis_basis.scope)?;
+    writeln!(
+        output,
+        "- Subject slice: model={}, lifecycle={}, components={}, mutations={}, paths={}, tests={}, evidence={}",
+        yes_no(report.analysis_basis.subject_slice.model_found),
+        yes_no(
+            report
+                .analysis_basis
+                .subject_slice
+                .lifecycle_candidate_found
+        ),
+        report.analysis_basis.subject_slice.related_components,
+        report.analysis_basis.subject_slice.mutation_sites,
+        report.analysis_basis.subject_slice.behavior_paths,
+        report.analysis_basis.subject_slice.related_tests,
+        report.analysis_basis.subject_slice.evidence_items,
+    )?;
+    writeln!(output, "- Data sources:")?;
+    write_limited_items(
+        output,
+        &report.analysis_basis.data_sources,
+        6,
+        |output, source| writeln!(output, "  - {source}"),
+    )?;
+    writeln!(output, "- Caveats:")?;
+    write_limited_items(
+        output,
+        &report.analysis_basis.caveats,
+        6,
+        |output, caveat| writeln!(output, "  - {caveat}"),
+    )?;
+
+    writeln!(output)?;
     writeln!(output, "Risks:")?;
     write_limited_items(output, &report.risks, 10, |output, risk| {
         writeln!(
@@ -483,6 +517,10 @@ fn write_limited_items<T>(
     }
 
     Ok(())
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 fn write_summary(

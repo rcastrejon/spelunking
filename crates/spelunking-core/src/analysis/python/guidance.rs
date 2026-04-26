@@ -13,6 +13,7 @@ use std::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DjangoGuidanceReport {
     pub subject: String,
+    pub analysis_basis: DjangoGuidanceBasis,
     pub risks: Vec<DjangoRiskSignal>,
     pub open_questions: Vec<DjangoOpenQuestion>,
     pub reading_path: Vec<DjangoReadingPathEntry>,
@@ -20,6 +21,25 @@ pub struct DjangoGuidanceReport {
     pub coupling_signals: Vec<DjangoCouplingSignal>,
     pub evidence: Vec<DjangoSubjectEvidence>,
     pub confidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DjangoGuidanceBasis {
+    pub scope: String,
+    pub data_sources: Vec<String>,
+    pub subject_slice: DjangoGuidanceSubjectSlice,
+    pub caveats: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DjangoGuidanceSubjectSlice {
+    pub model_found: bool,
+    pub lifecycle_candidate_found: bool,
+    pub related_components: usize,
+    pub mutation_sites: usize,
+    pub behavior_paths: usize,
+    pub related_tests: usize,
+    pub evidence_items: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -78,6 +98,7 @@ pub fn inspect_django_guidance(
 
     let related_tests =
         collect_related_tests(root, modules, &subject_report, &behavior_report, &parts);
+    let analysis_basis = build_analysis_basis(&subject_report, &behavior_report, &related_tests);
     let coupling_signals = build_coupling_signals(&subject_report, &behavior_report);
     let risks = build_risk_signals(
         &subject_report,
@@ -99,6 +120,7 @@ pub fn inspect_django_guidance(
 
     Ok(DjangoGuidanceReport {
         subject: subject_report.subject,
+        analysis_basis,
         risks,
         open_questions,
         reading_path,
@@ -107,6 +129,37 @@ pub fn inspect_django_guidance(
         evidence,
         confidence,
     })
+}
+
+fn build_analysis_basis(
+    subject_report: &DjangoSubjectReport,
+    behavior_report: &DjangoBehaviorReport,
+    related_tests: &[DjangoRelatedTest],
+) -> DjangoGuidanceBasis {
+    let evidence_items = subject_report.evidence.len() + behavior_report.evidence.len();
+
+    DjangoGuidanceBasis {
+        scope: "subject-focused behavioral slice".to_owned(),
+        data_sources: vec![
+            "inspect_django_subject structural radiography".to_owned(),
+            "inspect_django_behavior mutation sites and behavior paths".to_owned(),
+            "test-file scan for model, field, state, and mutation-method mentions".to_owned(),
+        ],
+        subject_slice: DjangoGuidanceSubjectSlice {
+            model_found: subject_report.model.is_some(),
+            lifecycle_candidate_found: subject_report.lifecycle_candidate.is_some(),
+            related_components: subject_report.related_components.len(),
+            mutation_sites: behavior_report.mutation_sites.len(),
+            behavior_paths: behavior_report.behavior_paths.len(),
+            related_tests: related_tests.len(),
+            evidence_items,
+        },
+        caveats: vec![
+            "This guidance is not built from a literal GraphExport subgraph; it uses the subject and behavior analyzers as the subject slice.".to_owned(),
+            "Risk and coupling signals are heuristic and depend on detected mutation sites, behavior paths, path naming, and app-area inference.".to_owned(),
+            "Absence of a risk or test match should be treated as absence of evidence, not proof that the behavior is safe or untested.".to_owned(),
+        ],
+    }
 }
 
 fn build_risk_signals(

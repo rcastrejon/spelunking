@@ -109,8 +109,9 @@ pub use super::behavior::{
     inspect_django_behavior,
 };
 pub use super::guidance::{
-    DjangoCouplingSignal, DjangoGuidanceReport, DjangoOpenQuestion, DjangoReadingPathEntry,
-    DjangoRelatedTest, DjangoRiskSignal, inspect_django_guidance,
+    DjangoCouplingSignal, DjangoGuidanceBasis, DjangoGuidanceReport, DjangoGuidanceSubjectSlice,
+    DjangoOpenQuestion, DjangoReadingPathEntry, DjangoRelatedTest, DjangoRiskSignal,
+    inspect_django_guidance,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2442,6 +2443,18 @@ def test_payment_confirms_reservation(db):
             inspect_django_guidance(&project.path, &report.modules, "Reservation.status")
                 .expect("guidance inspection should succeed");
 
+        assert_eq!(
+            guidance.analysis_basis.scope,
+            "subject-focused behavioral slice"
+        );
+        assert_eq!(guidance.analysis_basis.subject_slice.related_tests, 2);
+        assert!(
+            guidance
+                .analysis_basis
+                .caveats
+                .iter()
+                .any(|caveat| caveat.contains("not built from a literal GraphExport subgraph"))
+        );
         assert!(guidance.risks.iter().any(|risk| {
             risk.title == "Distributed lifecycle ownership" && risk.severity == "high"
         }));
