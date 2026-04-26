@@ -104,6 +104,12 @@ pub struct DjangoSubjectEvidence {
     pub detail: String,
 }
 
+pub use super::artifacts::{
+    DJANGO_EVIDENCE_PACK_SCHEMA_VERSION, DjangoArtifactBundle, DjangoEvidenceConfidence,
+    DjangoEvidenceLifecycle, DjangoEvidencePack, DjangoEvidenceRelationshipMap,
+    build_django_artifact_bundle, build_django_evidence_pack, django_subject_slug,
+    render_django_evaluation_report, render_django_markdown_report,
+};
 pub use super::behavior::{
     DjangoBehaviorPath, DjangoBehaviorReport, DjangoBehaviorStep, DjangoMutationSite,
     inspect_django_behavior,
@@ -2490,6 +2496,34 @@ def test_payment_confirms_reservation(db):
                 .reading_path
                 .iter()
                 .any(|entry| entry.path == "payments/webhooks.py")
+        );
+
+        let artifacts =
+            build_django_artifact_bundle(&project.path, &report.modules, "Reservation.status")
+                .expect("artifact generation should succeed");
+        assert_eq!(artifacts.evidence_pack.schema_version, 1);
+        assert_eq!(artifacts.evidence_pack.subject, "Reservation.status");
+        assert!(artifacts.evidence_pack.mutation_sites.iter().any(|site| {
+            site.path == "payments/webhooks.py" && site.mutation.contains("status")
+        }));
+        assert!(
+            artifacts
+                .markdown_report
+                .contains("# Reservation.status Lifecycle Report")
+        );
+        assert!(
+            artifacts
+                .markdown_report
+                .contains("## Recommended Reading Path")
+        );
+        assert!(
+            artifacts
+                .evaluation_report
+                .contains("## Comparison Scorecard")
+        );
+        assert_eq!(
+            django_subject_slug("reservations.Reservation.status"),
+            "reservations-reservation-status"
         );
     }
 }

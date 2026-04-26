@@ -1,14 +1,15 @@
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use spelunking_core::{
-    DjangoBehaviorReport, DjangoGuidanceReport, DjangoSubjectReport, Edge, EdgeType, GraphExport,
-    GraphFilter, Node, NodeType, PythonParseDiagnostic, PythonParseReport, analyze_python_project,
-    discover_python_files, inspect_django_behavior, inspect_django_guidance,
-    inspect_django_subject, parse_python_files, relative_path_identifier,
+    DjangoArtifactBundle, DjangoBehaviorReport, DjangoGuidanceReport, DjangoSubjectReport, Edge,
+    EdgeType, GraphExport, GraphFilter, Node, NodeType, PythonParseDiagnostic, PythonParseReport,
+    analyze_python_project, build_django_artifact_bundle, discover_python_files,
+    django_subject_slug, inspect_django_behavior, inspect_django_guidance, inspect_django_subject,
+    parse_python_files, relative_path_identifier,
 };
 use std::{
     collections::HashSet,
-    fs::File,
+    fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
     process::ExitCode,
@@ -48,6 +49,30 @@ struct Cli {
     /// Inspect operational risks, open questions, reading path, and related tests for a Django model field.
     #[arg(long = "inspect-guidance", value_name = "MODEL.FIELD")]
     inspect_guidance: Option<String>,
+
+    /// Generate the JSON evidence pack for a Django model field under the artifact directory.
+    #[arg(long = "generate-evidence-pack", value_name = "MODEL.FIELD")]
+    generate_evidence_pack: Option<String>,
+
+    /// Generate the Markdown lifecycle report for a Django model field under the artifact directory.
+    #[arg(long = "generate-report", value_name = "MODEL.FIELD")]
+    generate_report: Option<String>,
+
+    /// Generate the Markdown evaluation scorecard for a Django model field under the artifact directory.
+    #[arg(long = "generate-evaluation", value_name = "MODEL.FIELD")]
+    generate_evaluation: Option<String>,
+
+    /// Generate evidence pack, Markdown report, and evaluation scorecard together.
+    #[arg(long = "generate-artifacts", value_name = "MODEL.FIELD")]
+    generate_artifacts: Option<String>,
+
+    /// Directory for generated subject artifacts, relative to the target project unless absolute.
+    #[arg(
+        long = "artifact-dir",
+        value_name = "PATH",
+        default_value = ".domain-atlas"
+    )]
+    artifact_dir: PathBuf,
 
     /// Include only these node types. Repeat the flag or use comma-separated values.
     #[arg(long = "node-type", value_name = "TYPE", value_parser = parse_node_type, value_delimiter = ',')]
@@ -92,6 +117,10 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         cli.inspect_subject.is_some(),
         cli.inspect_behavior.is_some(),
         cli.inspect_guidance.is_some(),
+        cli.generate_evidence_pack.is_some(),
+        cli.generate_report.is_some(),
+        cli.generate_evaluation.is_some(),
+        cli.generate_artifacts.is_some(),
     ]
     .into_iter()
     .filter(|enabled| *enabled)
@@ -100,7 +129,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     if inspect_modes > 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--inspect-subject, --inspect-behavior, and --inspect-guidance cannot be used together",
+            "--inspect-subject, --inspect-behavior, --inspect-guidance, and artifact generation flags cannot be used together",
         )
         .into());
     }
@@ -109,7 +138,29 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let parse_report = parse_python_files(&python_files);
     let mut output = output_writer(cli.output.as_deref())?;
 
-    if let Some(subject) = &cli.inspect_guidance {
+    if let Some(subject) = &cli.generate_artifacts {
+        ensure_artifact_summary_format(cli.format, "--generate-artifacts")?;
+        let bundle = build_django_artifact_bundle(&cli.target, &parse_report.modules, subject)?;
+        let generated = write_django_artifacts(&cli, subject, &bundle, ArtifactSelection::All)?;
+        write_generated_artifacts_summary(&mut output, &generated)?;
+    } else if let Some(subject) = &cli.generate_evidence_pack {
+        ensure_artifact_summary_format(cli.format, "--generate-evidence-pack")?;
+        let bundle = build_django_artifact_bundle(&cli.target, &parse_report.modules, subject)?;
+        let generated =
+            write_django_artifacts(&cli, subject, &bundle, ArtifactSelection::EvidencePack)?;
+        write_generated_artifacts_summary(&mut output, &generated)?;
+    } else if let Some(subject) = &cli.generate_report {
+        ensure_artifact_summary_format(cli.format, "--generate-report")?;
+        let bundle = build_django_artifact_bundle(&cli.target, &parse_report.modules, subject)?;
+        let generated = write_django_artifacts(&cli, subject, &bundle, ArtifactSelection::Report)?;
+        write_generated_artifacts_summary(&mut output, &generated)?;
+    } else if let Some(subject) = &cli.generate_evaluation {
+        ensure_artifact_summary_format(cli.format, "--generate-evaluation")?;
+        let bundle = build_django_artifact_bundle(&cli.target, &parse_report.modules, subject)?;
+        let generated =
+            write_django_artifacts(&cli, subject, &bundle, ArtifactSelection::Evaluation)?;
+        write_generated_artifacts_summary(&mut output, &generated)?;
+    } else if let Some(subject) = &cli.inspect_guidance {
         let report = inspect_django_guidance(&cli.target, &parse_report.modules, subject)?;
 
         match cli.format {
@@ -189,6 +240,129 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactSelection {
+    EvidencePack,
+    Report,
+    Evaluation,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneratedArtifact {
+    label: &'static str,
+    path: PathBuf,
+}
+
+fn ensure_artifact_summary_format(
+    format: OutputFormat,
+    flag: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if format == OutputFormat::Summary {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{flag} writes fixed artifact formats and supports only --format summary"),
+        )
+        .into())
+    }
+}
+
+fn write_django_artifacts(
+    cli: &Cli,
+    subject: &str,
+    bundle: &DjangoArtifactBundle,
+    selection: ArtifactSelection,
+) -> Result<Vec<GeneratedArtifact>, Box<dyn std::error::Error>> {
+    let base_dir = artifact_base_dir(&cli.target, &cli.artifact_dir);
+    let slug = django_subject_slug(subject);
+    let mut generated = Vec::new();
+
+    if matches!(
+        selection,
+        ArtifactSelection::EvidencePack | ArtifactSelection::All
+    ) {
+        let path = base_dir.join("evidence-packs").join(format!("{slug}.json"));
+        write_json_file(&path, &bundle.evidence_pack)?;
+        generated.push(GeneratedArtifact {
+            label: "Evidence pack",
+            path,
+        });
+    }
+
+    if matches!(
+        selection,
+        ArtifactSelection::Report | ArtifactSelection::All
+    ) {
+        let path = base_dir
+            .join("reports")
+            .join(format!("{slug}-lifecycle.md"));
+        write_text_file(&path, &bundle.markdown_report)?;
+        generated.push(GeneratedArtifact {
+            label: "Markdown report",
+            path,
+        });
+    }
+
+    if matches!(
+        selection,
+        ArtifactSelection::Evaluation | ArtifactSelection::All
+    ) {
+        let path = base_dir
+            .join("evaluation")
+            .join(format!("{slug}-evaluation.md"));
+        write_text_file(&path, &bundle.evaluation_report)?;
+        generated.push(GeneratedArtifact {
+            label: "Evaluation scorecard",
+            path,
+        });
+    }
+
+    Ok(generated)
+}
+
+fn artifact_base_dir(target: &Path, artifact_dir: &Path) -> PathBuf {
+    if artifact_dir.is_absolute() {
+        artifact_dir.to_path_buf()
+    } else {
+        target.join(artifact_dir)
+    }
+}
+
+fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let file = File::create(path)?;
+    let mut writer = io::BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, value)?;
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn write_text_file(path: &Path, contents: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::write(path, contents)
+}
+
+fn write_generated_artifacts_summary(
+    output: &mut dyn Write,
+    generated: &[GeneratedArtifact],
+) -> io::Result<()> {
+    writeln!(output, "Generated:")?;
+
+    for artifact in generated {
+        writeln!(output, "- {}: {}", artifact.label, artifact.path.display())?;
+    }
+
+    Ok(())
 }
 
 fn write_subject_summary(output: &mut dyn Write, report: &DjangoSubjectReport) -> io::Result<()> {

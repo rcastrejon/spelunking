@@ -6,13 +6,17 @@ pub mod graph;
 pub mod parsing;
 
 pub use analysis::python::subject::{
-    DjangoBehaviorPath, DjangoBehaviorReport, DjangoBehaviorStep, DjangoCouplingSignal,
+    DJANGO_EVIDENCE_PACK_SCHEMA_VERSION, DjangoArtifactBundle, DjangoBehaviorPath,
+    DjangoBehaviorReport, DjangoBehaviorStep, DjangoCouplingSignal, DjangoEvidenceConfidence,
+    DjangoEvidenceLifecycle, DjangoEvidencePack, DjangoEvidenceRelationshipMap,
     DjangoGuidanceBasis, DjangoGuidanceReport, DjangoGuidanceSubjectSlice,
     DjangoLifecycleCandidate, DjangoMutationSite, DjangoOpenQuestion, DjangoReadingPathEntry,
     DjangoRelatedComponent, DjangoRelatedModel, DjangoRelatedTest, DjangoRelevantMethod,
     DjangoRiskSignal, DjangoSubjectCandidate, DjangoSubjectError, DjangoSubjectEvidence,
     DjangoSubjectField, DjangoSubjectModel, DjangoSubjectReport, DjangoSubjectState,
+    build_django_artifact_bundle, build_django_evidence_pack, django_subject_slug,
     inspect_django_behavior, inspect_django_guidance, inspect_django_subject,
+    render_django_evaluation_report, render_django_markdown_report,
 };
 pub use analysis::{
     AnalysisContext, AnalysisPipeline, Analyzer, SourceLanguage, analyze_python_project,

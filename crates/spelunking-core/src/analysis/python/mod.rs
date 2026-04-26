@@ -1,3 +1,4 @@
+mod artifacts;
 mod behavior;
 pub mod django;
 mod guidance;
