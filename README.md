@@ -47,11 +47,19 @@ cargo run -p spelunking-cli -- /path/to/django-project --inspect-guidance reserv
 
 Guidance is generated from the subject-focused behavioral slice produced by `--inspect-subject` and `--inspect-behavior`; it is not yet a literal `GraphExport` subgraph filtered to the subject. The risk and coupling signals are intentionally heuristic, so the output includes an analysis-basis section with data sources, slice counts, and caveats.
 
-Extract candidate domain facts from the evidence pack for the subject. Domain facts translate technical evidence into proposed, reviewable domain knowledge with evidence, confidence, origin, basis, and review status:
+Extract candidate domain facts from one or more evidence packs for the subject. Domain facts translate technical evidence into proposed, reviewable domain knowledge with evidence, confidence, origin, basis, and review status:
 
 ```sh
 cargo run -p spelunking-cli -- /path/to/django-project --inspect-domain-facts reservations.Reservation.status
 ```
+
+Pass multiple subjects as repeated values or comma-separated values to produce one merged fact set:
+
+```sh
+cargo run -p spelunking-cli -- /path/to/django-project --inspect-domain-facts reservations.Reservation.status,payments.Payment.status
+```
+
+Domain facts use schema version `1`. Each JSONL line includes `id`, `pack_id`, `statement`, `type`, `subject`, `technical_subject`, `primary_concept`, `field_concept`, `evidence`, `confidence`, `origin`, `basis`, `status`, and `rationale`. Valid `type` values are `domain_concept_candidate`, `lifecycle_candidate`, `business_rule_candidate`, `flow_step`, `concept_relationship`, `boundary_risk`, `side_effect`, `open_question`, `pending_decision`, and `glossary_term_candidate`. Increment 1 emits `origin` values `programmatic` or `heuristic`, `basis` values `observed` or `inferred`, and `status` value `proposed`; later review work may introduce `llm`, `human`, `confirmed`, `rejected`, and `stale`.
 
 Generate consumable artifacts for humans and agents. By default these are written under `.domain-atlas` in the inspected project:
 
@@ -62,7 +70,7 @@ cargo run -p spelunking-cli -- /path/to/django-project --generate-artifacts rese
 This writes:
 
 - `.domain-atlas/evidence-packs/reservations-reservation-status.json`: compact JSON evidence pack for agents/LLMs
-- `.domain-atlas/facts/reservations-reservation-status-domain-facts.jsonl`: candidate domain facts extracted from the evidence pack
+- `.domain-atlas/facts/domain-facts.jsonl`: candidate domain facts extracted from the evidence pack
 - `.domain-atlas/reports/reservations-reservation-status-lifecycle.md`: short human lifecycle report
 - `.domain-atlas/evaluation/reservations-reservation-status-evaluation.md`: scorecard for comparing manual exploration, a generic agent, and an agent using the evidence pack
 

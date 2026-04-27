@@ -105,10 +105,12 @@ pub struct DjangoSubjectEvidence {
 }
 
 pub use super::artifacts::{
-    DJANGO_DOMAIN_FACT_SCHEMA_VERSION, DJANGO_EVIDENCE_PACK_SCHEMA_VERSION, DjangoArtifactBundle,
-    DjangoDomainFact, DjangoEvidenceConfidence, DjangoEvidenceLifecycle, DjangoEvidencePack,
-    DjangoEvidenceRelationshipMap, build_django_artifact_bundle, build_django_evidence_pack,
-    django_subject_slug, extract_django_domain_facts, render_django_domain_facts_jsonl,
+    DJANGO_DOMAIN_FACT_BASES, DJANGO_DOMAIN_FACT_ORIGINS, DJANGO_DOMAIN_FACT_SCHEMA_VERSION,
+    DJANGO_DOMAIN_FACT_STATUSES, DJANGO_DOMAIN_FACT_TYPES, DJANGO_EVIDENCE_PACK_SCHEMA_VERSION,
+    DjangoArtifactBundle, DjangoDomainFact, DjangoEvidenceConfidence, DjangoEvidenceLifecycle,
+    DjangoEvidencePack, DjangoEvidenceRelationshipMap, build_django_artifact_bundle,
+    build_django_evidence_pack, django_subject_slug, extract_django_domain_facts,
+    extract_django_domain_facts_from_packs, render_django_domain_facts_jsonl,
     render_django_evaluation_report, render_django_markdown_report,
 };
 pub use super::behavior::{

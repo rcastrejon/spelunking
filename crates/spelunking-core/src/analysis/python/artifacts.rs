@@ -8,10 +8,36 @@ use super::subject::{
 };
 use crate::parsing::ParsedPythonModule;
 use serde::Serialize;
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 pub const DJANGO_EVIDENCE_PACK_SCHEMA_VERSION: u32 = 1;
 pub const DJANGO_DOMAIN_FACT_SCHEMA_VERSION: u32 = 1;
+
+/// Domain fact types emitted by the Increment 1 extractor.
+pub const DJANGO_DOMAIN_FACT_TYPES: &[&str] = &[
+    "domain_concept_candidate",
+    "lifecycle_candidate",
+    "business_rule_candidate",
+    "flow_step",
+    "concept_relationship",
+    "boundary_risk",
+    "side_effect",
+    "open_question",
+    "pending_decision",
+    "glossary_term_candidate",
+];
+
+/// Source classes for a fact. Increment 1 emits only programmatic and heuristic facts.
+pub const DJANGO_DOMAIN_FACT_ORIGINS: &[&str] = &["programmatic", "heuristic", "llm", "human"];
+
+/// Evidence basis for a fact. Confirmed is reserved for a later review loop.
+pub const DJANGO_DOMAIN_FACT_BASES: &[&str] = &["observed", "inferred", "confirmed"];
+
+/// Review statuses for facts. Increment 1 extraction emits only proposed facts.
+pub const DJANGO_DOMAIN_FACT_STATUSES: &[&str] = &["proposed", "confirmed", "rejected", "stale"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DjangoEvidencePack {
@@ -56,20 +82,38 @@ pub struct DjangoEvidenceConfidence {
     pub overall: String,
 }
 
+/// Candidate domain knowledge extracted from one evidence pack.
+///
+/// `subject` remains a backward-compatible alias for `technical_subject`. `pack_id`
+/// indexes the evidence pack in merged JSONL output, while `primary_concept` and
+/// `field_concept` are candidate business concepts that must remain reviewable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DjangoDomainFact {
     pub schema_version: u32,
     pub id: String,
+    pub pack_id: String,
     pub statement: String,
     #[serde(rename = "type")]
     pub fact_type: String,
+    /// Backward-compatible alias for the technical subject, such as Reservation.status.
     pub subject: String,
+    pub technical_subject: String,
+    pub primary_concept: Option<String>,
+    pub field_concept: Option<String>,
     pub evidence: Vec<DjangoSubjectEvidence>,
     pub confidence: String,
     pub origin: String,
     pub basis: String,
     pub status: String,
     pub rationale: String,
+}
+
+#[derive(Debug, Clone)]
+struct DomainFactContext {
+    pack_id: String,
+    technical_subject: String,
+    primary_concept: Option<String>,
+    field_concept: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,15 +160,35 @@ pub fn build_django_artifact_bundle(
 }
 
 pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomainFact> {
+    extract_django_domain_facts_from_packs(std::slice::from_ref(pack))
+}
+
+/// Extracts a single fact set from one or more evidence packs.
+///
+/// Merge policy: facts are deduplicated by `(pack_id, technical_subject, type, statement)`.
+/// Duplicate facts merge and deduplicate evidence, keep the strongest confidence, and keep
+/// the most review-sensitive basis/origin when values differ.
+pub fn extract_django_domain_facts_from_packs(
+    packs: &[DjangoEvidencePack],
+) -> Vec<DjangoDomainFact> {
+    let facts = packs
+        .iter()
+        .flat_map(extract_django_domain_facts_for_pack)
+        .collect::<Vec<_>>();
+
+    finalize_domain_facts(facts)
+}
+
+fn extract_django_domain_facts_for_pack(pack: &DjangoEvidencePack) -> Vec<DjangoDomainFact> {
     let model_name = domain_model_name(pack);
     let field_name = domain_field_name(pack);
-    let subject = pack.subject.clone();
+    let context = domain_fact_context(pack, &model_name, &field_name);
     let mut facts = Vec::new();
 
     push_domain_fact(
         &mut facts,
+        &context,
         "domain_concept_candidate",
-        subject.clone(),
         format!("{model_name} appears to be a domain concept in this behavior slice."),
         model_evidence(pack),
         pack.lifecycle.confidence.clone(),
@@ -133,11 +197,13 @@ pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomai
         "The evidence pack found a Django model as the primary subject of the inspected behavior.",
     );
 
-    if pack.lifecycle.field.is_some() {
+    if pack.lifecycle.field.is_some()
+        && (!pack.lifecycle.states.is_empty() || !pack.mutation_sites.is_empty())
+    {
         push_domain_fact(
             &mut facts,
+            &context,
             "lifecycle_candidate",
-            subject.clone(),
             format!("{model_name} appears to have a lifecycle controlled by `{field_name}`."),
             lifecycle_evidence(pack),
             pack.lifecycle.confidence.clone(),
@@ -150,8 +216,8 @@ pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomai
     if !pack.lifecycle.states.is_empty() {
         push_domain_fact(
             &mut facts,
+            &context,
             "lifecycle_candidate",
-            subject.clone(),
             format!(
                 "{model_name}.{field_name} exposes observed lifecycle states: {}.",
                 state_values(&pack.lifecycle.states)
@@ -167,8 +233,8 @@ pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomai
     for relationship in &pack.relationship_map.related_models {
         push_domain_fact(
             &mut facts,
+            &context,
             "concept_relationship",
-            subject.clone(),
             format!(
                 "{model_name} is related to {} through `{}` ({}).",
                 relationship.model, relationship.field, relationship.relationship
@@ -196,8 +262,8 @@ pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomai
         if let Some(state) = state_value_from_mutation(site, &pack.lifecycle.states) {
             push_domain_fact(
                 &mut facts,
+                &context,
                 "flow_step",
-                subject.clone(),
                 format!("{model_name}.{field_name} is set to `{state}` through {channel}."),
                 mutation_evidence.clone(),
                 site.confidence.clone(),
@@ -207,8 +273,8 @@ pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomai
             );
             push_domain_fact(
                 &mut facts,
+                &context,
                 "business_rule_candidate",
-                subject.clone(),
                 transition_statement(&model_name, &state, site),
                 mutation_evidence.clone(),
                 site.confidence.clone(),
@@ -219,8 +285,8 @@ pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomai
         } else {
             push_domain_fact(
                 &mut facts,
+                &context,
                 "flow_step",
-                subject.clone(),
                 format!("{model_name}.{field_name} is mutated through {channel}."),
                 mutation_evidence.clone(),
                 site.confidence.clone(),
@@ -236,8 +302,8 @@ pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomai
         ) {
             push_domain_fact(
                 &mut facts,
+                &context,
                 "side_effect",
-                subject.clone(),
                 format!(
                     "{model_name}.{field_name} can change outside the normal request path through {channel}."
                 ),
@@ -253,8 +319,8 @@ pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomai
     for signal in &pack.coupling_signals {
         push_domain_fact(
             &mut facts,
+            &context,
             "boundary_risk",
-            subject.clone(),
             signal.description.clone(),
             signal.evidence.clone(),
             signal.confidence.clone(),
@@ -272,8 +338,8 @@ pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomai
         };
         push_domain_fact(
             &mut facts,
+            &context,
             fact_type,
-            subject.clone(),
             risk.description.clone(),
             risk.evidence.clone(),
             risk.confidence.clone(),
@@ -286,8 +352,8 @@ pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomai
     for question in &pack.open_questions {
         push_domain_fact(
             &mut facts,
+            &context,
             "open_question",
-            subject.clone(),
             question.question.clone(),
             question.evidence.clone(),
             question.confidence.clone(),
@@ -299,8 +365,8 @@ pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomai
         if let Some(statement) = pending_decision_statement(&model_name, &field_name, question) {
             push_domain_fact(
                 &mut facts,
+                &context,
                 "pending_decision",
-                subject.clone(),
                 statement,
                 question.evidence.clone(),
                 question.confidence.clone(),
@@ -313,8 +379,8 @@ pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomai
 
     push_domain_fact(
         &mut facts,
+        &context,
         "glossary_term_candidate",
-        subject.clone(),
         format!("`{model_name}` is a candidate glossary term for this behavior slice."),
         model_evidence(pack),
         pack.lifecycle.confidence.clone(),
@@ -326,8 +392,8 @@ pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomai
     if !pack.lifecycle.states.is_empty() {
         push_domain_fact(
             &mut facts,
+            &context,
             "glossary_term_candidate",
-            subject,
             format!(
                 "{} are candidate lifecycle vocabulary terms for {model_name}.{field_name}.",
                 state_values(&pack.lifecycle.states)
@@ -340,7 +406,7 @@ pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomai
         );
     }
 
-    finalize_domain_facts(&pack.subject, facts)
+    facts
 }
 
 pub fn render_django_domain_facts_jsonl(
@@ -799,8 +865,8 @@ fn risk_summary(pack: &DjangoEvidencePack) -> String {
 
 fn push_domain_fact(
     facts: &mut Vec<DjangoDomainFact>,
+    context: &DomainFactContext,
     fact_type: &str,
-    subject: String,
     statement: String,
     evidence: Vec<DjangoSubjectEvidence>,
     confidence: String,
@@ -808,16 +874,20 @@ fn push_domain_fact(
     basis: &str,
     rationale: &str,
 ) {
-    if evidence.is_empty() {
+    if evidence.is_empty() || weak_generic_fact(fact_type, &confidence, evidence.len()) {
         return;
     }
 
     facts.push(DjangoDomainFact {
         schema_version: DJANGO_DOMAIN_FACT_SCHEMA_VERSION,
         id: String::new(),
+        pack_id: context.pack_id.clone(),
         statement,
         fact_type: fact_type.to_owned(),
-        subject,
+        subject: context.technical_subject.clone(),
+        technical_subject: context.technical_subject.clone(),
+        primary_concept: context.primary_concept.clone(),
+        field_concept: context.field_concept.clone(),
         evidence,
         confidence,
         origin: origin.to_owned(),
@@ -827,22 +897,119 @@ fn push_domain_fact(
     });
 }
 
-fn finalize_domain_facts(subject: &str, mut facts: Vec<DjangoDomainFact>) -> Vec<DjangoDomainFact> {
+fn finalize_domain_facts(facts: Vec<DjangoDomainFact>) -> Vec<DjangoDomainFact> {
+    let mut merged = BTreeMap::<(String, String, String, String), DjangoDomainFact>::new();
+
+    for mut fact in facts {
+        sort_and_dedup_evidence(&mut fact.evidence);
+        let key = (
+            fact.pack_id.clone(),
+            fact.technical_subject.clone(),
+            fact.fact_type.clone(),
+            fact.statement.clone(),
+        );
+
+        if let Some(existing) = merged.get_mut(&key) {
+            existing.evidence.append(&mut fact.evidence);
+            sort_and_dedup_evidence(&mut existing.evidence);
+            existing.confidence = strongest_confidence(&existing.confidence, &fact.confidence);
+            existing.origin = merged_origin(&existing.origin, &fact.origin);
+            existing.basis = merged_basis(&existing.basis, &fact.basis);
+        } else {
+            merged.insert(key, fact);
+        }
+    }
+
+    let mut facts = merged.into_values().collect::<Vec<_>>();
     facts.sort_by(|left, right| {
-        left.fact_type
-            .cmp(&right.fact_type)
+        left.pack_id
+            .cmp(&right.pack_id)
+            .then(left.fact_type.cmp(&right.fact_type))
+            .then(left.technical_subject.cmp(&right.technical_subject))
             .then(left.statement.cmp(&right.statement))
     });
-    facts.dedup_by(|left, right| {
-        left.fact_type == right.fact_type && left.statement == right.statement
-    });
 
-    let slug = django_subject_slug(subject);
+    let mut counters = BTreeMap::<String, usize>::new();
     for (index, fact) in facts.iter_mut().enumerate() {
-        fact.id = format!("{slug}-fact-{:03}", index + 1);
+        let counter = counters.entry(fact.pack_id.clone()).or_default();
+        *counter += 1;
+        fact.id = format!("{}-fact-{counter:03}", fact.pack_id);
+
+        if fact.pack_id.is_empty() {
+            fact.id = format!("domain-fact-{:03}", index + 1);
+        }
     }
 
     facts
+}
+
+fn domain_fact_context(
+    pack: &DjangoEvidencePack,
+    model_name: &str,
+    field_name: &str,
+) -> DomainFactContext {
+    DomainFactContext {
+        pack_id: django_subject_slug(&pack.subject),
+        technical_subject: pack.subject.clone(),
+        primary_concept: pack.lifecycle.model.as_ref().map(|_| model_name.to_owned()),
+        field_concept: pack.lifecycle.field.as_ref().map(|_| field_name.to_owned()),
+    }
+}
+
+fn weak_generic_fact(fact_type: &str, confidence: &str, evidence_count: usize) -> bool {
+    matches!(
+        fact_type,
+        "domain_concept_candidate" | "glossary_term_candidate" | "lifecycle_candidate"
+    ) && confidence == "low"
+        && evidence_count <= 1
+}
+
+fn sort_and_dedup_evidence(evidence: &mut Vec<DjangoSubjectEvidence>) {
+    evidence.sort();
+    evidence.dedup();
+}
+
+fn strongest_confidence(left: &str, right: &str) -> String {
+    if confidence_rank(right) > confidence_rank(left) {
+        right.to_owned()
+    } else {
+        left.to_owned()
+    }
+}
+
+fn confidence_rank(confidence: &str) -> usize {
+    match confidence {
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+fn merged_origin(left: &str, right: &str) -> String {
+    if left == right {
+        left.to_owned()
+    } else if left == "human" || right == "human" {
+        "human".to_owned()
+    } else if left == "llm" || right == "llm" {
+        "llm".to_owned()
+    } else if left == "heuristic" || right == "heuristic" {
+        "heuristic".to_owned()
+    } else {
+        "programmatic".to_owned()
+    }
+}
+
+fn merged_basis(left: &str, right: &str) -> String {
+    if left == right {
+        left.to_owned()
+    } else if left == "confirmed" || right == "confirmed" {
+        "confirmed".to_owned()
+    } else if left == "inferred" || right == "inferred" {
+        "inferred".to_owned()
+    } else {
+        "observed".to_owned()
+    }
 }
 
 fn domain_model_name(pack: &DjangoEvidencePack) -> String {
@@ -887,6 +1054,16 @@ fn model_evidence(pack: &DjangoEvidencePack) -> Vec<DjangoSubjectEvidence> {
 fn lifecycle_evidence(pack: &DjangoEvidencePack) -> Vec<DjangoSubjectEvidence> {
     let mut evidence = model_evidence(pack);
     evidence.extend(state_evidence(pack).into_iter().take(4));
+    evidence.extend(
+        pack.mutation_sites
+            .iter()
+            .take(4)
+            .map(|site| DjangoSubjectEvidence {
+                path: site.path.clone(),
+                line: site.line,
+                detail: format!("{} mutation in {}", site.kind, site.container_name),
+            }),
+    );
     evidence
 }
 
@@ -907,13 +1084,14 @@ fn state_value_from_mutation(
     states: &[DjangoSubjectState],
 ) -> Option<String> {
     let value = site.value.as_deref().unwrap_or(&site.mutation);
-    let normalized_value = domain_token(value);
+    let value_tokens = domain_tokens(value);
 
     states
         .iter()
         .find(|state| {
             let normalized_state = domain_token(&state.value);
-            !normalized_state.is_empty() && normalized_value.contains(&normalized_state)
+            !normalized_state.is_empty()
+                && value_tokens.iter().any(|token| token == &normalized_state)
         })
         .map(|state| state.value.clone())
 }
@@ -924,6 +1102,25 @@ fn domain_token(value: &str) -> String {
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn domain_tokens(value: &str) -> BTreeSet<String> {
+    let mut tokens = BTreeSet::new();
+    let collapsed = domain_token(value);
+
+    if !collapsed.is_empty() {
+        tokens.insert(collapsed);
+    }
+
+    for token in value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .map(domain_token)
+        .filter(|token| !token.is_empty())
+    {
+        tokens.insert(token);
+    }
+
+    tokens
 }
 
 fn mutation_channel(site: &DjangoMutationSite) -> String {
@@ -1022,4 +1219,215 @@ fn push_limited<T>(
 fn push_line(output: &mut String, line: &str) {
     output.push_str(line);
     output.push('\n');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::python::subject::DjangoGuidanceSubjectSlice;
+
+    #[test]
+    fn merges_domain_facts_from_multiple_packs_with_pack_scoped_ids() {
+        let reservation = minimal_pack(
+            "Reservation.status",
+            "Reservation",
+            "status",
+            &["pending", "confirmed"],
+            vec![mutation_site(
+                "webhook",
+                "payments/webhooks.py",
+                12,
+                "payment_webhook",
+                Some("Reservation.CONFIRMED"),
+            )],
+        );
+        let payment = minimal_pack(
+            "Payment.status",
+            "Payment",
+            "status",
+            &["pending", "captured"],
+            vec![mutation_site(
+                "model_method",
+                "payments/models.py",
+                20,
+                "Payment.capture",
+                Some("Payment.CAPTURED"),
+            )],
+        );
+
+        let facts = extract_django_domain_facts_from_packs(&[reservation, payment]);
+
+        assert!(facts.iter().any(|fact| {
+            fact.pack_id == "reservation-status"
+                && fact.technical_subject == "Reservation.status"
+                && fact.primary_concept.as_deref() == Some("Reservation")
+                && fact.field_concept.as_deref() == Some("status")
+        }));
+        assert!(facts.iter().any(|fact| {
+            fact.pack_id == "payment-status"
+                && fact.id.starts_with("payment-status-fact-")
+                && fact.statement.contains("Payment.status")
+        }));
+    }
+
+    #[test]
+    fn deduplicates_same_pack_facts_and_merges_evidence() {
+        let first = minimal_pack(
+            "Reservation.status",
+            "Reservation",
+            "status",
+            &["confirmed"],
+            vec![mutation_site(
+                "webhook",
+                "payments/webhooks.py",
+                12,
+                "payment_webhook",
+                Some("Reservation.CONFIRMED"),
+            )],
+        );
+        let duplicate = minimal_pack(
+            "Reservation.status",
+            "Reservation",
+            "status",
+            &["confirmed"],
+            vec![mutation_site(
+                "webhook",
+                "payments/alternate_webhooks.py",
+                18,
+                "alternate_payment_webhook",
+                Some("Reservation.CONFIRMED"),
+            )],
+        );
+
+        let facts = extract_django_domain_facts_from_packs(&[first, duplicate]);
+        let domain_concepts = facts
+            .iter()
+            .filter(|fact| fact.fact_type == "domain_concept_candidate")
+            .collect::<Vec<_>>();
+
+        assert_eq!(domain_concepts.len(), 1);
+        assert_eq!(domain_concepts[0].pack_id, "reservation-status");
+    }
+
+    #[test]
+    fn matches_mutation_states_by_exact_token_not_substring() {
+        let pack = minimal_pack(
+            "Trip.status",
+            "Trip",
+            "status",
+            &["active", "inactive"],
+            vec![mutation_site(
+                "task",
+                "trips/tasks.py",
+                30,
+                "deactivate_trips",
+                Some("TripStatus.INACTIVE"),
+            )],
+        );
+
+        let facts = extract_django_domain_facts(&pack);
+
+        assert!(facts.iter().any(|fact| {
+            fact.fact_type == "flow_step" && fact.statement.contains("`inactive`")
+        }));
+        assert!(!facts.iter().any(|fact| {
+            matches!(
+                fact.fact_type.as_str(),
+                "flow_step" | "business_rule_candidate"
+            ) && fact.statement.contains("`active`")
+                && !fact.statement.contains("`inactive`")
+        }));
+    }
+
+    fn minimal_pack(
+        subject: &str,
+        model_name: &str,
+        field_name: &str,
+        states: &[&str],
+        mutation_sites: Vec<DjangoMutationSite>,
+    ) -> DjangoEvidencePack {
+        DjangoEvidencePack {
+            schema_version: DJANGO_EVIDENCE_PACK_SCHEMA_VERSION,
+            subject: subject.to_owned(),
+            lifecycle: DjangoEvidenceLifecycle {
+                model: Some(DjangoSubjectModel {
+                    name: model_name.to_owned(),
+                    qualified_name: model_name.to_owned(),
+                    python_qualified_name: model_name.to_owned(),
+                    path: format!("{}/models.py", model_name.to_ascii_lowercase()),
+                    line: 10,
+                    evidence: format!("class {model_name}(models.Model):"),
+                    confidence: "high".to_owned(),
+                }),
+                field: Some(field_name.to_owned()),
+                field_type: Some("CharField".to_owned()),
+                states: states
+                    .iter()
+                    .enumerate()
+                    .map(|(index, state)| DjangoSubjectState {
+                        value: (*state).to_owned(),
+                        path: format!("{}/models.py", model_name.to_ascii_lowercase()),
+                        line: 20 + index,
+                        evidence: format!("{state:?}"),
+                        confidence: "high".to_owned(),
+                    })
+                    .collect(),
+                confidence: "high".to_owned(),
+            },
+            relationship_map: DjangoEvidenceRelationshipMap {
+                related_models: Vec::new(),
+                related_components: Vec::new(),
+                behavior_paths: Vec::new(),
+                confidence: "medium".to_owned(),
+            },
+            mutation_sites,
+            behavior_paths: Vec::new(),
+            risk_signals: Vec::new(),
+            open_questions: Vec::new(),
+            reading_path: Vec::new(),
+            related_tests: Vec::new(),
+            coupling_signals: Vec::new(),
+            evidence: Vec::new(),
+            analysis_basis: DjangoGuidanceBasis {
+                scope: "test pack".to_owned(),
+                data_sources: Vec::new(),
+                subject_slice: DjangoGuidanceSubjectSlice {
+                    model_found: true,
+                    lifecycle_candidate_found: true,
+                    related_components: 0,
+                    mutation_sites: 0,
+                    behavior_paths: 0,
+                    related_tests: 0,
+                    evidence_items: 0,
+                },
+                caveats: Vec::new(),
+            },
+            confidence: DjangoEvidenceConfidence {
+                subject: "high".to_owned(),
+                behavior: "high".to_owned(),
+                guidance: "medium".to_owned(),
+                overall: "medium".to_owned(),
+            },
+        }
+    }
+
+    fn mutation_site(
+        container_kind: &str,
+        path: &str,
+        line: usize,
+        container_name: &str,
+        value: Option<&str>,
+    ) -> DjangoMutationSite {
+        DjangoMutationSite {
+            kind: "direct_assignment".to_owned(),
+            container_kind: container_kind.to_owned(),
+            container_name: container_name.to_owned(),
+            path: path.to_owned(),
+            line,
+            evidence: format!("status = {}", value.unwrap_or("<unknown>")),
+            mutation: format!("status = {}", value.unwrap_or("<unknown>")),
+            value: value.map(str::to_owned),
+            confidence: "high".to_owned(),
+        }
+    }
 }
