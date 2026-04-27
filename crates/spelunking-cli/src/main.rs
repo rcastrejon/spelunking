@@ -151,7 +151,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     if inspect_modes > 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--inspect-subject, --inspect-behavior, --inspect-guidance, --inspect-domain-facts, and artifact generation flags cannot be used together",
+            "--inspect-subject, --inspect-behavior, --inspect-guidance, --inspect-domain-facts, --inspect-domain-facts-from-pack, and artifact generation flags cannot be used together",
         )
         .into());
     }
@@ -159,8 +159,10 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut output = output_writer(cli.output.as_deref())?;
 
     if !cli.inspect_domain_facts_from_packs.is_empty() {
-        let facts =
-            build_domain_facts_from_evidence_pack_paths(&cli.inspect_domain_facts_from_packs)?;
+        let facts = build_domain_facts_from_evidence_pack_paths(
+            &cli.target,
+            &cli.inspect_domain_facts_from_packs,
+        )?;
 
         match cli.format {
             OutputFormat::Summary => write_domain_facts_summary(&mut output, &facts)?,
@@ -180,8 +182,10 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     if !cli.generate_domain_facts_from_packs.is_empty() {
         ensure_artifact_summary_format(cli.format, "--generate-domain-facts-from-pack")?;
-        let facts =
-            build_domain_facts_from_evidence_pack_paths(&cli.generate_domain_facts_from_packs)?;
+        let facts = build_domain_facts_from_evidence_pack_paths(
+            &cli.target,
+            &cli.generate_domain_facts_from_packs,
+        )?;
         let generated = write_domain_facts_artifact(&cli, &facts)?;
         write_generated_artifacts_summary(&mut output, &generated)?;
         output.flush()?;
@@ -430,23 +434,41 @@ fn build_domain_facts_for_subjects(
 }
 
 fn build_domain_facts_from_evidence_pack_paths(
+    target: &Path,
     paths: &[PathBuf],
 ) -> Result<Vec<DjangoDomainFact>, Box<dyn std::error::Error>> {
     let mut packs = Vec::new();
 
     for path in paths {
-        packs.push(read_evidence_pack(path)?);
+        packs.push(read_evidence_pack(target, path)?);
     }
 
     Ok(extract_django_domain_facts_from_packs(&packs))
 }
 
-fn read_evidence_pack(path: &Path) -> Result<DjangoEvidencePack, Box<dyn std::error::Error>> {
-    let file = File::open(path)?;
+fn read_evidence_pack(
+    target: &Path,
+    path: &Path,
+) -> Result<DjangoEvidencePack, Box<dyn std::error::Error>> {
+    let resolved_path = resolve_evidence_pack_path(target, path);
+    let file = File::open(&resolved_path)?;
     let reader = io::BufReader::new(file);
     let pack = serde_json::from_reader(reader)?;
 
     Ok(pack)
+}
+
+fn resolve_evidence_pack_path(target: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() || path.exists() {
+        return path.to_path_buf();
+    }
+
+    let target_relative = target.join(path);
+    if target_relative.exists() {
+        target_relative
+    } else {
+        path.to_path_buf()
+    }
 }
 
 fn write_domain_facts_artifact(
@@ -1401,6 +1423,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn escapes_dot_attribute_values() {
@@ -1413,5 +1436,34 @@ mod tests {
     #[test]
     fn normalizes_path_prefixes_for_filtering() {
         assert_eq!(normalize_path_prefix("./shop/"), "shop");
+    }
+
+    #[test]
+    fn resolves_relative_evidence_pack_paths_against_target() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let target = std::env::temp_dir().join(format!(
+            "spelunking-cli-evidence-pack-target-{}-{stamp}",
+            std::process::id()
+        ));
+        let relative_path = Path::new(".domain-atlas/evidence-packs/ticket-status.json");
+        let target_relative_path = target.join(relative_path);
+
+        fs::create_dir_all(
+            target_relative_path
+                .parent()
+                .expect("path should have parent"),
+        )
+        .expect("test directory should be created");
+        fs::write(&target_relative_path, "{}").expect("test file should be written");
+
+        assert_eq!(
+            resolve_evidence_pack_path(&target, relative_path),
+            target_relative_path
+        );
+
+        let _ = fs::remove_dir_all(target);
     }
 }

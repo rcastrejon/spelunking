@@ -65,6 +65,8 @@ Already generated evidence-pack JSON files can be used without re-running projec
 cargo run -p spelunking-cli -- /path/to/django-project --inspect-domain-facts-from-pack .domain-atlas/evidence-packs/reservations-reservation-status.json
 ```
 
+Relative pack paths are resolved from the current working directory first, then from the inspected target directory. This allows generated `.domain-atlas/...` paths to be reused directly.
+
 Domain facts use schema version `1`. Each JSONL line includes `id`, `pack_id`, `statement`, `type`, `subject`, `technical_subject`, `primary_concept`, `field_concept`, `evidence`, `confidence`, `origin`, `basis`, `status`, `requires_human_review`, and `rationale`. Valid `type` values are `domain_concept_candidate`, `lifecycle_candidate`, `business_rule_candidate`, `flow_step`, `concept_relationship`, `boundary_risk`, `side_effect`, `open_question`, `pending_decision`, and `glossary_term_candidate`. Increment 1 emits `origin` values `programmatic` or `heuristic`, `basis` values `observed` or `inferred`, `status` value `proposed`, and `requires_human_review=true`; later review work may introduce `llm`, `human`, `confirmed`, `rejected`, and `stale`.
 
 Generate consumable artifacts for humans and agents. By default these are written under `.domain-atlas` in the inspected project:
