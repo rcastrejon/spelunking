@@ -106,12 +106,16 @@ pub struct DjangoSubjectEvidence {
 
 pub use super::artifacts::{
     DJANGO_DOMAIN_FACT_BASES, DJANGO_DOMAIN_FACT_ORIGINS, DJANGO_DOMAIN_FACT_SCHEMA_VERSION,
-    DJANGO_DOMAIN_FACT_STATUSES, DJANGO_DOMAIN_FACT_TYPES, DJANGO_EVIDENCE_PACK_SCHEMA_VERSION,
-    DjangoArtifactBundle, DjangoDomainFact, DjangoEvidenceConfidence, DjangoEvidenceLifecycle,
-    DjangoEvidencePack, DjangoEvidenceRelationshipMap, build_django_artifact_bundle,
-    build_django_evidence_pack, django_subject_slug, extract_django_domain_facts,
-    extract_django_domain_facts_from_packs, render_django_domain_facts_jsonl,
-    render_django_evaluation_report, render_django_markdown_report,
+    DJANGO_DOMAIN_FACT_STATUSES, DJANGO_DOMAIN_FACT_TYPES, DJANGO_DOMAIN_FLOW_SCHEMA_VERSION,
+    DJANGO_EVIDENCE_PACK_SCHEMA_VERSION, DjangoArtifactBundle, DjangoDomainFact, DjangoDomainFlow,
+    DjangoDomainFlowFinding, DjangoDomainFlowStep, DjangoEvidenceConfidence,
+    DjangoEvidenceLifecycle, DjangoEvidencePack, DjangoEvidenceRelationshipMap,
+    build_django_artifact_bundle, build_django_evidence_pack, django_subject_slug,
+    extract_django_domain_facts, extract_django_domain_facts_from_packs,
+    interpret_django_domain_flows, interpret_django_domain_flows_from_packs,
+    interpret_django_domain_flows_from_packs_and_facts, render_django_domain_facts_jsonl,
+    render_django_domain_flow_markdown, render_django_evaluation_report,
+    render_django_markdown_report,
 };
 pub use super::behavior::{
     DjangoBehaviorPath, DjangoBehaviorReport, DjangoBehaviorStep, DjangoMutationSite,
@@ -2540,6 +2544,28 @@ def test_payment_confirms_reservation(db):
                 && fact
                     .statement
                     .contains("Which module should own valid transitions")
+        }));
+        assert!(artifacts.domain_flows.iter().any(|flow| {
+            flow.name == "Reservation lifecycle"
+                && flow
+                    .business_summary
+                    .contains("Reservation appears to move through")
+                && flow
+                    .developer_summary
+                    .contains("Reservation.status is observed")
+                && flow.steps.iter().any(|step| {
+                    step.statement
+                        .contains("sets Reservation.status to `confirmed`")
+                })
+                && flow.candidate_rules.iter().any(|rule| {
+                    rule.statement
+                        .contains("Reservation may become `confirmed`")
+                })
+                && flow.open_questions.iter().any(|question| {
+                    question
+                        .statement
+                        .contains("Which module should own valid transitions")
+                })
         }));
         let facts_jsonl = render_django_domain_facts_jsonl(&artifacts.domain_facts)
             .expect("domain facts JSONL should render");

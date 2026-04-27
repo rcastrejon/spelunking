@@ -1,13 +1,14 @@
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use spelunking_core::{
-    DjangoArtifactBundle, DjangoBehaviorReport, DjangoDomainFact, DjangoEvidencePack,
-    DjangoGuidanceReport, DjangoSubjectReport, Edge, EdgeType, GraphExport, GraphFilter, Node,
-    NodeType, PythonParseDiagnostic, PythonParseReport, analyze_python_project,
+    DjangoArtifactBundle, DjangoBehaviorReport, DjangoDomainFact, DjangoDomainFlow,
+    DjangoEvidencePack, DjangoGuidanceReport, DjangoSubjectReport, Edge, EdgeType, GraphExport,
+    GraphFilter, Node, NodeType, PythonParseDiagnostic, PythonParseReport, analyze_python_project,
     build_django_artifact_bundle, build_django_evidence_pack, discover_python_files,
     django_subject_slug, extract_django_domain_facts_from_packs, inspect_django_behavior,
-    inspect_django_guidance, inspect_django_subject, parse_python_files, relative_path_identifier,
-    render_django_domain_facts_jsonl,
+    inspect_django_guidance, inspect_django_subject, interpret_django_domain_flows_from_packs,
+    parse_python_files, relative_path_identifier, render_django_domain_facts_jsonl,
+    render_django_domain_flow_markdown,
 };
 use std::{
     collections::HashSet,
@@ -60,6 +61,14 @@ struct Cli {
     #[arg(long = "inspect-domain-facts-from-pack", value_name = "PATH", value_delimiter = ',', num_args = 1..)]
     inspect_domain_facts_from_packs: Vec<PathBuf>,
 
+    /// Interpret business flows and candidate rules for one or more Django model fields.
+    #[arg(long = "inspect-domain-flows", value_name = "MODEL.FIELD", value_delimiter = ',', num_args = 1..)]
+    inspect_domain_flows: Vec<String>,
+
+    /// Interpret business flows and candidate rules from already generated evidence-pack JSON files.
+    #[arg(long = "inspect-domain-flows-from-pack", value_name = "PATH", value_delimiter = ',', num_args = 1..)]
+    inspect_domain_flows_from_packs: Vec<PathBuf>,
+
     /// Generate the JSON evidence pack for a Django model field under the artifact directory.
     #[arg(long = "generate-evidence-pack", value_name = "MODEL.FIELD")]
     generate_evidence_pack: Option<String>,
@@ -72,6 +81,14 @@ struct Cli {
     #[arg(long = "generate-domain-facts-from-pack", value_name = "PATH", value_delimiter = ',', num_args = 1..)]
     generate_domain_facts_from_packs: Vec<PathBuf>,
 
+    /// Generate Markdown flow fiches for one or more Django model fields under the artifact directory.
+    #[arg(long = "generate-domain-flows", value_name = "MODEL.FIELD", value_delimiter = ',', num_args = 1..)]
+    generate_domain_flows: Vec<String>,
+
+    /// Generate Markdown flow fiches from already generated evidence-pack JSON files.
+    #[arg(long = "generate-domain-flows-from-pack", value_name = "PATH", value_delimiter = ',', num_args = 1..)]
+    generate_domain_flows_from_packs: Vec<PathBuf>,
+
     /// Generate the Markdown lifecycle report for a Django model field under the artifact directory.
     #[arg(long = "generate-report", value_name = "MODEL.FIELD")]
     generate_report: Option<String>,
@@ -80,7 +97,7 @@ struct Cli {
     #[arg(long = "generate-evaluation", value_name = "MODEL.FIELD")]
     generate_evaluation: Option<String>,
 
-    /// Generate evidence pack, Markdown report, and evaluation scorecard together.
+    /// Generate evidence pack, domain facts, domain flows, Markdown report, and evaluation scorecard together.
     #[arg(long = "generate-artifacts", value_name = "MODEL.FIELD")]
     generate_artifacts: Option<String>,
 
@@ -137,9 +154,13 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         cli.inspect_guidance.is_some(),
         !cli.inspect_domain_facts.is_empty(),
         !cli.inspect_domain_facts_from_packs.is_empty(),
+        !cli.inspect_domain_flows.is_empty(),
+        !cli.inspect_domain_flows_from_packs.is_empty(),
         cli.generate_evidence_pack.is_some(),
         !cli.generate_domain_facts.is_empty(),
         !cli.generate_domain_facts_from_packs.is_empty(),
+        !cli.generate_domain_flows.is_empty(),
+        !cli.generate_domain_flows_from_packs.is_empty(),
         cli.generate_report.is_some(),
         cli.generate_evaluation.is_some(),
         cli.generate_artifacts.is_some(),
@@ -151,7 +172,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     if inspect_modes > 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--inspect-subject, --inspect-behavior, --inspect-guidance, --inspect-domain-facts, --inspect-domain-facts-from-pack, and artifact generation flags cannot be used together",
+            "--inspect-subject, --inspect-behavior, --inspect-guidance, domain understanding inspect flags, and artifact generation flags cannot be used together",
         )
         .into());
     }
@@ -192,6 +213,40 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    if !cli.inspect_domain_flows_from_packs.is_empty() {
+        let flows = build_domain_flows_from_evidence_pack_paths(
+            &cli.target,
+            &cli.inspect_domain_flows_from_packs,
+        )?;
+
+        match cli.format {
+            OutputFormat::Summary => write_domain_flows_summary(&mut output, &flows)?,
+            OutputFormat::Json => write_domain_flows_json(&mut output, &flows)?,
+            OutputFormat::Dot => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--inspect-domain-flows-from-pack supports --format summary or --format json",
+                )
+                .into());
+            }
+        }
+
+        output.flush()?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if !cli.generate_domain_flows_from_packs.is_empty() {
+        ensure_artifact_summary_format(cli.format, "--generate-domain-flows-from-pack")?;
+        let flows = build_domain_flows_from_evidence_pack_paths(
+            &cli.target,
+            &cli.generate_domain_flows_from_packs,
+        )?;
+        let generated = write_domain_flow_artifacts(&cli, &flows)?;
+        write_generated_artifacts_summary(&mut output, &generated)?;
+        output.flush()?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let python_files = discover_python_files(&cli.target)?;
     let parse_report = parse_python_files(&python_files);
 
@@ -214,6 +269,15 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             &cli.generate_domain_facts,
         )?;
         let generated = write_domain_facts_artifact(&cli, &facts)?;
+        write_generated_artifacts_summary(&mut output, &generated)?;
+    } else if !cli.generate_domain_flows.is_empty() {
+        ensure_artifact_summary_format(cli.format, "--generate-domain-flows")?;
+        let flows = build_domain_flows_for_subjects(
+            &cli.target,
+            &parse_report,
+            &cli.generate_domain_flows,
+        )?;
+        let generated = write_domain_flow_artifacts(&cli, &flows)?;
         write_generated_artifacts_summary(&mut output, &generated)?;
     } else if let Some(subject) = &cli.generate_report {
         ensure_artifact_summary_format(cli.format, "--generate-report")?;
@@ -251,6 +315,21 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "--inspect-domain-facts supports --format summary or --format json",
+                )
+                .into());
+            }
+        }
+    } else if !cli.inspect_domain_flows.is_empty() {
+        let flows =
+            build_domain_flows_for_subjects(&cli.target, &parse_report, &cli.inspect_domain_flows)?;
+
+        match cli.format {
+            OutputFormat::Summary => write_domain_flows_summary(&mut output, &flows)?,
+            OutputFormat::Json => write_domain_flows_json(&mut output, &flows)?,
+            OutputFormat::Dot => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--inspect-domain-flows supports --format summary or --format json",
                 )
                 .into());
             }
@@ -384,6 +463,13 @@ fn write_django_artifacts(
         });
     }
 
+    if matches!(selection, ArtifactSelection::All) {
+        generated.extend(write_domain_flow_artifacts_to_base(
+            &base_dir,
+            &bundle.domain_flows,
+        )?);
+    }
+
     if matches!(
         selection,
         ArtifactSelection::Report | ArtifactSelection::All
@@ -446,6 +532,37 @@ fn build_domain_facts_from_evidence_pack_paths(
     Ok(extract_django_domain_facts_from_packs(&packs))
 }
 
+fn build_domain_flows_for_subjects(
+    target: &Path,
+    parse_report: &PythonParseReport,
+    subjects: &[String],
+) -> Result<Vec<DjangoDomainFlow>, Box<dyn std::error::Error>> {
+    let mut packs = Vec::new();
+
+    for subject in subjects {
+        packs.push(build_django_evidence_pack(
+            target,
+            &parse_report.modules,
+            subject,
+        )?);
+    }
+
+    Ok(interpret_django_domain_flows_from_packs(&packs))
+}
+
+fn build_domain_flows_from_evidence_pack_paths(
+    target: &Path,
+    paths: &[PathBuf],
+) -> Result<Vec<DjangoDomainFlow>, Box<dyn std::error::Error>> {
+    let mut packs = Vec::new();
+
+    for path in paths {
+        packs.push(read_evidence_pack(target, path)?);
+    }
+
+    Ok(interpret_django_domain_flows_from_packs(&packs))
+}
+
 fn read_evidence_pack(
     target: &Path,
     path: &Path,
@@ -485,6 +602,33 @@ fn write_domain_facts_artifact(
         label: "Domain facts",
         path,
     }])
+}
+
+fn write_domain_flow_artifacts(
+    cli: &Cli,
+    flows: &[DjangoDomainFlow],
+) -> Result<Vec<GeneratedArtifact>, Box<dyn std::error::Error>> {
+    let base_dir = artifact_base_dir(&cli.target, &cli.artifact_dir);
+    write_domain_flow_artifacts_to_base(&base_dir, flows)
+}
+
+fn write_domain_flow_artifacts_to_base(
+    base_dir: &Path,
+    flows: &[DjangoDomainFlow],
+) -> Result<Vec<GeneratedArtifact>, Box<dyn std::error::Error>> {
+    let mut generated = Vec::new();
+
+    for flow in flows {
+        let path = base_dir.join("flows").join(format!("{}.md", flow.id));
+        let contents = render_django_domain_flow_markdown(flow);
+        write_text_file(&path, &contents)?;
+        generated.push(GeneratedArtifact {
+            label: "Domain flow",
+            path,
+        });
+    }
+
+    Ok(generated)
 }
 
 fn artifact_base_dir(target: &Path, artifact_dir: &Path) -> PathBuf {
@@ -893,6 +1037,78 @@ fn write_domain_facts_json(
     facts: &[DjangoDomainFact],
 ) -> Result<(), serde_json::Error> {
     serde_json::to_writer_pretty(&mut *output, facts)?;
+    writeln!(output).map_err(serde_json::Error::io)
+}
+
+fn write_domain_flows_summary(
+    output: &mut dyn Write,
+    flows: &[DjangoDomainFlow],
+) -> io::Result<()> {
+    if flows.is_empty() {
+        writeln!(output, "Domain flows proposed: none")?;
+        return Ok(());
+    }
+
+    writeln!(output, "Domain flows proposed: {}", flows.len())?;
+
+    for flow in flows {
+        writeln!(output)?;
+        writeln!(
+            output,
+            "- {} ({}, {}, {})",
+            flow.name, flow.pack_id, flow.status, flow.confidence
+        )?;
+        writeln!(output, "  Technical subject: {}", flow.technical_subject)?;
+        writeln!(output, "  Business summary: {}", flow.business_summary)?;
+        writeln!(output, "  Developer summary: {}", flow.developer_summary)?;
+        writeln!(output, "  Steps: {}", flow.steps.len())?;
+
+        for step in flow.steps.iter().take(5) {
+            writeln!(
+                output,
+                "  {}. {} Evidence: {}:{}",
+                step.order, step.statement, step.path, step.line
+            )?;
+        }
+
+        if flow.steps.len() > 5 {
+            writeln!(output, "  ... {} more steps", flow.steps.len() - 5)?;
+        }
+
+        if !flow.candidate_rules.is_empty() {
+            writeln!(output, "  Candidate rules:")?;
+            for rule in flow.candidate_rules.iter().take(5) {
+                writeln!(output, "  - {}", rule.statement)?;
+            }
+        }
+
+        if !flow.open_questions.is_empty() {
+            writeln!(output, "  Open questions:")?;
+            for question in flow.open_questions.iter().take(5) {
+                writeln!(output, "  - {}", question.statement)?;
+            }
+        }
+
+        if !flow.recommended_reading.is_empty() {
+            writeln!(output, "  Recommended reading:")?;
+            for entry in flow.recommended_reading.iter().take(5) {
+                writeln!(
+                    output,
+                    "  - {}:{} - {}",
+                    entry.path, entry.line, entry.reason
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn write_domain_flows_json(
+    output: &mut dyn Write,
+    flows: &[DjangoDomainFlow],
+) -> Result<(), serde_json::Error> {
+    serde_json::to_writer_pretty(&mut *output, flows)?;
     writeln!(output).map_err(serde_json::Error::io)
 }
 

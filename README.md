@@ -69,6 +69,26 @@ Relative pack paths are resolved from the current working directory first, then 
 
 Domain facts use schema version `1`. Each JSONL line includes `id`, `pack_id`, `statement`, `type`, `subject`, `technical_subject`, `primary_concept`, `field_concept`, `evidence`, `confidence`, `origin`, `basis`, `status`, `requires_human_review`, and `rationale`. Valid `type` values are `domain_concept_candidate`, `lifecycle_candidate`, `business_rule_candidate`, `flow_step`, `concept_relationship`, `boundary_risk`, `side_effect`, `open_question`, `pending_decision`, and `glossary_term_candidate`. Increment 1 emits `origin` values `programmatic` or `heuristic`, `basis` values `observed` or `inferred`, `status` value `proposed`, and `requires_human_review=true`; later review work may introduce `llm`, `human`, `confirmed`, `rejected`, and `stale`.
 
+Interpret candidate business flows from behavior paths and domain facts. A flow fiche translates technical paths into business and developer summaries, observed steps, candidate rules, side effects, risks, open questions, and recommended reading:
+
+```sh
+cargo run -p spelunking-cli -- /path/to/django-project --inspect-domain-flows reservations.Reservation.status
+```
+
+Like domain facts, flow interpretation accepts multiple subjects or one or more generated evidence-pack JSON files:
+
+```sh
+cargo run -p spelunking-cli -- /path/to/django-project --inspect-domain-flows-from-pack .domain-atlas/evidence-packs/reservations-reservation-status.json
+```
+
+Generate Markdown flow fiches under `.domain-atlas/flows/`:
+
+```sh
+cargo run -p spelunking-cli -- /path/to/django-project --generate-domain-flows reservations.Reservation.status,payments.Payment.status
+```
+
+Domain flows use schema version `1`. Each flow includes `id`, `pack_id`, `name`, `technical_subject`, `primary_concept`, `field_concept`, `business_summary`, `developer_summary`, `steps`, `candidate_rules`, `side_effects`, `risks`, `open_questions`, `recommended_reading`, `evidence`, `confidence`, `status`, and `requires_human_review`. Increment 2 emits reviewable `proposed` flows; observed steps come from behavior paths, while rules, side effects, risks, and questions come from proposed domain facts.
+
 Generate consumable artifacts for humans and agents. By default these are written under `.domain-atlas` in the inspected project:
 
 ```sh
@@ -79,10 +99,11 @@ This writes:
 
 - `.domain-atlas/evidence-packs/reservations-reservation-status.json`: compact JSON evidence pack for agents/LLMs
 - `.domain-atlas/facts/domain-facts.jsonl`: candidate domain facts extracted from the evidence pack
+- `.domain-atlas/flows/reservations-reservation-status-lifecycle-flow.md`: flow and rule interpretation fiche
 - `.domain-atlas/reports/reservations-reservation-status-lifecycle.md`: short human lifecycle report
 - `.domain-atlas/evaluation/reservations-reservation-status-evaluation.md`: scorecard for comparing manual exploration, a generic agent, and an agent using the evidence pack
 
-Generate a single artifact with `--generate-evidence-pack`, `--generate-domain-facts`, `--generate-domain-facts-from-pack`, `--generate-report`, or `--generate-evaluation`. Use `--artifact-dir` to write somewhere else.
+Generate a single artifact with `--generate-evidence-pack`, `--generate-domain-facts`, `--generate-domain-facts-from-pack`, `--generate-domain-flows`, `--generate-domain-flows-from-pack`, `--generate-report`, or `--generate-evaluation`. Use `--artifact-dir` to write somewhere else.
 
 The CLI can also emit the current graph contract as versioned JSON. The export includes summary counts, filters, parse/read diagnostics, and the graph itself. The graph contains source-file, Django app, model, URL, view, serializer, form, service, middleware, context processor, signal, signal handler, and task nodes, plus containment, call, inheritance, direct ORM relationship, URL routing, serialization, query, global hook intercept, and trigger edges:
 

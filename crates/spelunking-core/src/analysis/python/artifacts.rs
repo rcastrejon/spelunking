@@ -1,10 +1,10 @@
 use super::subject::{
-    DjangoBehaviorPath, DjangoBehaviorReport, DjangoCouplingSignal, DjangoGuidanceBasis,
-    DjangoGuidanceReport, DjangoLifecycleCandidate, DjangoMutationSite, DjangoOpenQuestion,
-    DjangoReadingPathEntry, DjangoRelatedComponent, DjangoRelatedModel, DjangoRelatedTest,
-    DjangoRiskSignal, DjangoSubjectError, DjangoSubjectEvidence, DjangoSubjectModel,
-    DjangoSubjectReport, DjangoSubjectState, inspect_django_behavior, inspect_django_guidance,
-    inspect_django_subject,
+    DjangoBehaviorPath, DjangoBehaviorReport, DjangoBehaviorStep, DjangoCouplingSignal,
+    DjangoGuidanceBasis, DjangoGuidanceReport, DjangoLifecycleCandidate, DjangoMutationSite,
+    DjangoOpenQuestion, DjangoReadingPathEntry, DjangoRelatedComponent, DjangoRelatedModel,
+    DjangoRelatedTest, DjangoRiskSignal, DjangoSubjectError, DjangoSubjectEvidence,
+    DjangoSubjectModel, DjangoSubjectReport, DjangoSubjectState, inspect_django_behavior,
+    inspect_django_guidance, inspect_django_subject,
 };
 use crate::parsing::ParsedPythonModule;
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use std::{
 
 pub const DJANGO_EVIDENCE_PACK_SCHEMA_VERSION: u32 = 1;
 pub const DJANGO_DOMAIN_FACT_SCHEMA_VERSION: u32 = 1;
+pub const DJANGO_DOMAIN_FLOW_SCHEMA_VERSION: u32 = 1;
 
 /// Domain fact types emitted by the Increment 1 extractor.
 pub const DJANGO_DOMAIN_FACT_TYPES: &[&str] = &[
@@ -109,6 +110,54 @@ pub struct DjangoDomainFact {
     pub rationale: String,
 }
 
+/// Reviewable flow interpretation derived from behavior paths and domain facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DjangoDomainFlow {
+    pub schema_version: u32,
+    pub id: String,
+    pub pack_id: String,
+    pub name: String,
+    pub technical_subject: String,
+    pub primary_concept: Option<String>,
+    pub field_concept: Option<String>,
+    pub business_summary: String,
+    pub developer_summary: String,
+    pub steps: Vec<DjangoDomainFlowStep>,
+    pub candidate_rules: Vec<DjangoDomainFlowFinding>,
+    pub side_effects: Vec<DjangoDomainFlowFinding>,
+    pub risks: Vec<DjangoDomainFlowFinding>,
+    pub open_questions: Vec<DjangoDomainFlowFinding>,
+    pub recommended_reading: Vec<DjangoReadingPathEntry>,
+    pub evidence: Vec<DjangoSubjectEvidence>,
+    pub confidence: String,
+    pub status: String,
+    pub requires_human_review: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DjangoDomainFlowStep {
+    pub path_kind: String,
+    pub order: usize,
+    pub statement: String,
+    pub technical_kind: String,
+    pub technical_name: String,
+    pub path: String,
+    pub line: usize,
+    pub evidence: String,
+    pub basis: String,
+    pub confidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DjangoDomainFlowFinding {
+    pub statement: String,
+    pub evidence: Vec<DjangoSubjectEvidence>,
+    pub confidence: String,
+    pub basis: String,
+    pub source: String,
+    pub requires_human_review: bool,
+}
+
 #[derive(Debug, Clone)]
 struct DomainFactContext {
     pack_id: String,
@@ -121,6 +170,7 @@ struct DomainFactContext {
 pub struct DjangoArtifactBundle {
     pub evidence_pack: DjangoEvidencePack,
     pub domain_facts: Vec<DjangoDomainFact>,
+    pub domain_flows: Vec<DjangoDomainFlow>,
     pub markdown_report: String,
     pub evaluation_report: String,
 }
@@ -149,12 +199,17 @@ pub fn build_django_artifact_bundle(
 ) -> Result<DjangoArtifactBundle, DjangoSubjectError> {
     let evidence_pack = build_django_evidence_pack(root, modules, subject)?;
     let domain_facts = extract_django_domain_facts(&evidence_pack);
+    let domain_flows = interpret_django_domain_flows_from_packs_and_facts(
+        std::slice::from_ref(&evidence_pack),
+        &domain_facts,
+    );
     let markdown_report = render_django_markdown_report(&evidence_pack);
     let evaluation_report = render_django_evaluation_report(&evidence_pack);
 
     Ok(DjangoArtifactBundle {
         evidence_pack,
         domain_facts,
+        domain_flows,
         markdown_report,
         evaluation_report,
     })
@@ -432,6 +487,498 @@ pub fn render_django_domain_facts_jsonl(
     }
 
     Ok(output)
+}
+
+pub fn interpret_django_domain_flows(
+    pack: &DjangoEvidencePack,
+    facts: &[DjangoDomainFact],
+) -> Vec<DjangoDomainFlow> {
+    interpret_django_domain_flows_from_packs_and_facts(std::slice::from_ref(pack), facts)
+}
+
+pub fn interpret_django_domain_flows_from_packs(
+    packs: &[DjangoEvidencePack],
+) -> Vec<DjangoDomainFlow> {
+    let facts = extract_django_domain_facts_from_packs(packs);
+    interpret_django_domain_flows_from_packs_and_facts(packs, &facts)
+}
+
+pub fn interpret_django_domain_flows_from_packs_and_facts(
+    packs: &[DjangoEvidencePack],
+    facts: &[DjangoDomainFact],
+) -> Vec<DjangoDomainFlow> {
+    let mut flows = packs
+        .iter()
+        .filter_map(|pack| interpret_django_domain_flow_for_pack(pack, facts))
+        .collect::<Vec<_>>();
+
+    flows.sort_by(|left, right| left.id.cmp(&right.id));
+    flows
+}
+
+pub fn render_django_domain_flow_markdown(flow: &DjangoDomainFlow) -> String {
+    let mut output = String::new();
+
+    push_line(&mut output, &format!("# {}", flow.name));
+    push_line(&mut output, "");
+    push_line(&mut output, &format!("- Flow id: `{}`", flow.id));
+    push_line(&mut output, &format!("- Pack: `{}`", flow.pack_id));
+    push_line(
+        &mut output,
+        &format!("- Technical subject: `{}`", flow.technical_subject),
+    );
+    push_line(&mut output, &format!("- Confidence: {}", flow.confidence));
+    push_line(&mut output, &format!("- Status: {}", flow.status));
+    push_line(
+        &mut output,
+        &format!(
+            "- Requires human review: {}",
+            if flow.requires_human_review {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+    );
+
+    push_line(&mut output, "");
+    push_line(&mut output, "## Business Summary");
+    push_line(&mut output, &flow.business_summary);
+
+    push_line(&mut output, "");
+    push_line(&mut output, "## Developer Summary");
+    push_line(&mut output, &flow.developer_summary);
+
+    push_line(&mut output, "");
+    push_line(&mut output, "## Steps");
+    if flow.steps.is_empty() {
+        push_line(&mut output, "- none");
+    } else {
+        for step in &flow.steps {
+            push_line(&mut output, &format!("{}. {}", step.order, step.statement));
+            push_line(
+                &mut output,
+                &format!(
+                    "   Evidence: `{}`:{} {}",
+                    step.path, step.line, step.evidence
+                ),
+            );
+        }
+    }
+
+    push_findings(&mut output, "## Candidate Rules", &flow.candidate_rules);
+    push_findings(&mut output, "## Side Effects", &flow.side_effects);
+    push_findings(&mut output, "## Risks", &flow.risks);
+    push_findings(&mut output, "## Open Questions", &flow.open_questions);
+
+    push_line(&mut output, "");
+    push_line(&mut output, "## Recommended Reading");
+    push_limited(&mut output, &flow.recommended_reading, 10, |entry| {
+        format!(
+            "{}. `{}`:{} - {}",
+            entry.priority, entry.path, entry.line, entry.reason
+        )
+    });
+
+    push_line(&mut output, "");
+    push_line(&mut output, "## Evidence");
+    push_limited(&mut output, &flow.evidence, 20, |evidence| {
+        format!(
+            "- `{}`:{} {}",
+            evidence.path, evidence.line, evidence.detail
+        )
+    });
+
+    output
+}
+
+fn interpret_django_domain_flow_for_pack(
+    pack: &DjangoEvidencePack,
+    facts: &[DjangoDomainFact],
+) -> Option<DjangoDomainFlow> {
+    if pack.behavior_paths.is_empty() && pack.mutation_sites.is_empty() {
+        return None;
+    }
+
+    let model_name = domain_model_name(pack);
+    let field_name = domain_field_name(pack);
+    let context = domain_fact_context(pack, &model_name, &field_name);
+    let pack_facts = facts
+        .iter()
+        .filter(|fact| fact.pack_id == context.pack_id)
+        .collect::<Vec<_>>();
+    let steps = domain_flow_steps(pack, &model_name, &field_name);
+    let candidate_rules = flow_findings_from_facts(&pack_facts, &["business_rule_candidate"]);
+    let side_effects = flow_findings_from_facts(&pack_facts, &["side_effect"]);
+    let risks = flow_findings_from_facts(&pack_facts, &["boundary_risk"]);
+    let open_questions =
+        flow_findings_from_facts(&pack_facts, &["open_question", "pending_decision"]);
+    let evidence = domain_flow_evidence(
+        &steps,
+        &candidate_rules,
+        &side_effects,
+        &risks,
+        &open_questions,
+    );
+
+    Some(DjangoDomainFlow {
+        schema_version: DJANGO_DOMAIN_FLOW_SCHEMA_VERSION,
+        id: format!("{}-lifecycle-flow", context.pack_id),
+        pack_id: context.pack_id,
+        name: flow_name(&model_name, &field_name, pack),
+        technical_subject: context.technical_subject,
+        primary_concept: context.primary_concept,
+        field_concept: context.field_concept,
+        business_summary: business_flow_summary(pack, &model_name, &field_name),
+        developer_summary: developer_flow_summary(pack, &model_name, &field_name),
+        steps,
+        candidate_rules,
+        side_effects,
+        risks,
+        open_questions,
+        recommended_reading: pack.reading_path.clone(),
+        evidence,
+        confidence: confidence_from_parts(&[
+            &pack.confidence.overall,
+            behavior_paths_confidence(&pack.behavior_paths),
+        ]),
+        status: "proposed".to_owned(),
+        requires_human_review: true,
+    })
+}
+
+fn domain_flow_steps(
+    pack: &DjangoEvidencePack,
+    model_name: &str,
+    field_name: &str,
+) -> Vec<DjangoDomainFlowStep> {
+    let mut steps = Vec::new();
+
+    for path in &pack.behavior_paths {
+        for step in &path.steps {
+            let mutation_site = pack
+                .mutation_sites
+                .iter()
+                .find(|site| site.path == step.path && site.line == step.line);
+            steps.push(DjangoDomainFlowStep {
+                path_kind: path.kind.clone(),
+                order: steps.len() + 1,
+                statement: domain_flow_step_statement(
+                    &path.kind,
+                    step,
+                    mutation_site,
+                    model_name,
+                    field_name,
+                    &pack.lifecycle.states,
+                ),
+                technical_kind: step.kind.clone(),
+                technical_name: step.name.clone(),
+                path: step.path.clone(),
+                line: step.line,
+                evidence: step.evidence.clone(),
+                basis: "observed".to_owned(),
+                confidence: path.confidence.clone(),
+            });
+        }
+    }
+
+    if steps.is_empty() {
+        for site in &pack.mutation_sites {
+            steps.push(DjangoDomainFlowStep {
+                path_kind: behavior_path_kind_for_flow(&site.container_kind).to_owned(),
+                order: steps.len() + 1,
+                statement: mutation_flow_statement(
+                    site,
+                    model_name,
+                    field_name,
+                    &pack.lifecycle.states,
+                ),
+                technical_kind: site.container_kind.clone(),
+                technical_name: site.container_name.clone(),
+                path: site.path.clone(),
+                line: site.line,
+                evidence: site.evidence.clone(),
+                basis: "observed".to_owned(),
+                confidence: site.confidence.clone(),
+            });
+        }
+    }
+
+    steps
+}
+
+fn domain_flow_step_statement(
+    path_kind: &str,
+    step: &DjangoBehaviorStep,
+    mutation_site: Option<&DjangoMutationSite>,
+    model_name: &str,
+    field_name: &str,
+    states: &[DjangoSubjectState],
+) -> String {
+    if let Some(site) = mutation_site {
+        return mutation_flow_statement(site, model_name, field_name, states);
+    }
+
+    match step.kind.as_str() {
+        "route" => format!(
+            "A route such as `{}` can start this {}.",
+            step.name,
+            human_path_kind(path_kind)
+        ),
+        "view" => format!(
+            "The API/controller step `{}` participates in this {}.",
+            step.name,
+            human_path_kind(path_kind)
+        ),
+        "serializer" => format!(
+            "The request data processing step `{}` participates before the lifecycle change.",
+            step.name
+        ),
+        "form" => format!(
+            "The form processing step `{}` participates before the lifecycle change.",
+            step.name
+        ),
+        "subject" => format!("The flow affects `{model_name}.{field_name}`."),
+        kind => format!(
+            "The {} step `{}` participates in this {}.",
+            human_step_kind(kind),
+            step.name,
+            human_path_kind(path_kind)
+        ),
+    }
+}
+
+fn mutation_flow_statement(
+    site: &DjangoMutationSite,
+    model_name: &str,
+    field_name: &str,
+    states: &[DjangoSubjectState],
+) -> String {
+    let channel = mutation_channel(site);
+
+    if let Some(state) = state_value_from_mutation(site, states) {
+        format!("{channel} sets {model_name}.{field_name} to `{state}`.")
+    } else {
+        format!("{channel} changes {model_name}.{field_name}.")
+    }
+}
+
+fn flow_findings_from_facts(
+    facts: &[&DjangoDomainFact],
+    fact_types: &[&str],
+) -> Vec<DjangoDomainFlowFinding> {
+    facts
+        .iter()
+        .filter(|fact| fact_types.contains(&fact.fact_type.as_str()))
+        .map(|fact| DjangoDomainFlowFinding {
+            statement: fact.statement.clone(),
+            evidence: fact.evidence.clone(),
+            confidence: fact.confidence.clone(),
+            basis: fact.basis.clone(),
+            source: fact.fact_type.clone(),
+            requires_human_review: fact.requires_human_review,
+        })
+        .collect()
+}
+
+fn domain_flow_evidence(
+    steps: &[DjangoDomainFlowStep],
+    candidate_rules: &[DjangoDomainFlowFinding],
+    side_effects: &[DjangoDomainFlowFinding],
+    risks: &[DjangoDomainFlowFinding],
+    open_questions: &[DjangoDomainFlowFinding],
+) -> Vec<DjangoSubjectEvidence> {
+    let mut evidence = steps
+        .iter()
+        .map(|step| DjangoSubjectEvidence {
+            path: step.path.clone(),
+            line: step.line,
+            detail: format!("{} step {}", step.path_kind, step.technical_name),
+        })
+        .collect::<Vec<_>>();
+
+    for finding in candidate_rules
+        .iter()
+        .chain(side_effects)
+        .chain(risks)
+        .chain(open_questions)
+    {
+        evidence.extend(finding.evidence.clone());
+    }
+
+    sort_and_dedup_evidence(&mut evidence);
+    evidence
+}
+
+fn flow_name(model_name: &str, field_name: &str, pack: &DjangoEvidencePack) -> String {
+    if pack.lifecycle.field.is_some() && !pack.lifecycle.states.is_empty() {
+        format!("{model_name} lifecycle")
+    } else {
+        format!("{model_name} {field_name} flow")
+    }
+}
+
+fn business_flow_summary(pack: &DjangoEvidencePack, model_name: &str, field_name: &str) -> String {
+    let states = state_values(&pack.lifecycle.states);
+    let surfaces = business_surfaces(pack);
+
+    if pack.lifecycle.states.is_empty() {
+        format!(
+            "{model_name} appears to have a business flow around `{field_name}`. The observed triggers include {surfaces}, and the exact business meaning needs review."
+        )
+    } else {
+        format!(
+            "{model_name} appears to move through {states}. The observed triggers include {surfaces}; this should be reviewed as proposed domain knowledge before relying on it."
+        )
+    }
+}
+
+fn developer_flow_summary(pack: &DjangoEvidencePack, model_name: &str, field_name: &str) -> String {
+    format!(
+        "{model_name}.{field_name} is observed through {} behavior paths and {} mutation sites across {}. Confidence is {}.",
+        pack.behavior_paths.len(),
+        pack.mutation_sites.len(),
+        technical_surfaces(pack),
+        pack.confidence.overall
+    )
+}
+
+fn business_surfaces(pack: &DjangoEvidencePack) -> String {
+    let mut surfaces = BTreeSet::new();
+
+    for path in &pack.behavior_paths {
+        surfaces.insert(
+            match path.kind.as_str() {
+                "api_path" => "user/API action",
+                "async_path" => "background processing",
+                "webhook_path" => "external callback",
+                "admin_path" => "admin operation",
+                "signal_path" => "implicit system reaction",
+                "management_path" => "operator command",
+                "model_path" => "model-level behavior",
+                _ => "application code",
+            }
+            .to_owned(),
+        );
+    }
+
+    for site in &pack.mutation_sites {
+        surfaces.insert(
+            match site.container_kind.as_str() {
+                "view" | "serializer" | "form" => "user/API action",
+                "task" | "async_function" => "background processing",
+                "webhook" => "external callback",
+                "admin_action" => "admin operation",
+                "signal_handler" => "implicit system reaction",
+                "model_method" => "model-level behavior",
+                "management_command" => "operator command",
+                _ => "application code",
+            }
+            .to_owned(),
+        );
+    }
+
+    if surfaces.is_empty() {
+        "no concrete trigger surface".to_owned()
+    } else {
+        surfaces.into_iter().collect::<Vec<_>>().join(", ")
+    }
+}
+
+fn technical_surfaces(pack: &DjangoEvidencePack) -> String {
+    let mut surfaces = BTreeSet::new();
+
+    for path in &pack.behavior_paths {
+        surfaces.insert(path.kind.as_str());
+    }
+
+    for site in &pack.mutation_sites {
+        surfaces.insert(site.container_kind.as_str());
+    }
+
+    if surfaces.is_empty() {
+        "no detected technical surfaces".to_owned()
+    } else {
+        surfaces.into_iter().collect::<Vec<_>>().join(", ")
+    }
+}
+
+fn behavior_paths_confidence(paths: &[DjangoBehaviorPath]) -> &str {
+    if paths.is_empty() {
+        "low"
+    } else if paths.iter().any(|path| path.confidence == "high") {
+        "high"
+    } else {
+        "medium"
+    }
+}
+
+fn human_path_kind(kind: &str) -> &'static str {
+    match kind {
+        "api_path" => "API-driven path",
+        "async_path" => "background-processing path",
+        "signal_path" => "signal-driven path",
+        "admin_path" => "admin path",
+        "webhook_path" => "webhook path",
+        "management_path" => "operator-command path",
+        "model_path" => "model-level path",
+        _ => "behavior path",
+    }
+}
+
+fn human_step_kind(kind: &str) -> &'static str {
+    match kind {
+        "task" => "background task",
+        "signal_handler" => "signal handler",
+        "webhook" => "webhook",
+        "admin_action" => "admin action",
+        "management_command" => "management command",
+        "model_method" => "model method",
+        _ => "technical",
+    }
+}
+
+fn behavior_path_kind_for_flow(container_kind: &str) -> &'static str {
+    match container_kind {
+        "view" | "serializer" | "form" => "api_path",
+        "task" | "async_function" => "async_path",
+        "signal_handler" => "signal_path",
+        "admin_action" => "admin_path",
+        "webhook" => "webhook_path",
+        "management_command" => "management_path",
+        "model_method" => "model_path",
+        _ => "behavior_path",
+    }
+}
+
+fn push_findings(output: &mut String, title: &str, findings: &[DjangoDomainFlowFinding]) {
+    push_line(output, "");
+    push_line(output, title);
+
+    if findings.is_empty() {
+        push_line(output, "- none");
+        return;
+    }
+
+    for finding in findings {
+        push_line(
+            output,
+            &format!(
+                "- {} ({}, {}, {})",
+                finding.statement, finding.source, finding.basis, finding.confidence
+            ),
+        );
+
+        for evidence in finding.evidence.iter().take(2) {
+            push_line(
+                output,
+                &format!(
+                    "  Evidence: `{}`:{} {}",
+                    evidence.path, evidence.line, evidence.detail
+                ),
+            );
+        }
+    }
 }
 
 pub fn render_django_markdown_report(pack: &DjangoEvidencePack) -> String {
@@ -1519,6 +2066,64 @@ mod tests {
                 && fact.primary_concept.as_deref() == Some("Reservation")
                 && fact.field_concept.as_deref() == Some("status")
         }));
+    }
+
+    #[test]
+    fn interprets_domain_flow_from_behavior_paths_and_facts() {
+        let mut pack = minimal_pack(
+            "Reservation.status",
+            "Reservation",
+            "status",
+            &["pending", "confirmed"],
+            vec![mutation_site(
+                "webhook",
+                "payments/webhooks.py",
+                12,
+                "payment_webhook",
+                Some("Reservation.CONFIRMED"),
+            )],
+        );
+        pack.behavior_paths = vec![DjangoBehaviorPath {
+            kind: "webhook_path".to_owned(),
+            confidence: "high".to_owned(),
+            steps: vec![
+                DjangoBehaviorStep {
+                    kind: "webhook".to_owned(),
+                    name: "payment_webhook".to_owned(),
+                    path: "payments/webhooks.py".to_owned(),
+                    line: 12,
+                    evidence: "reservation.status = Reservation.CONFIRMED".to_owned(),
+                },
+                DjangoBehaviorStep {
+                    kind: "subject".to_owned(),
+                    name: "Reservation.status".to_owned(),
+                    path: "reservation/models.py".to_owned(),
+                    line: 20,
+                    evidence: "status = models.CharField(...)".to_owned(),
+                },
+            ],
+        }];
+
+        let facts = extract_django_domain_facts(&pack);
+        let flows = interpret_django_domain_flows(&pack, &facts);
+
+        assert_eq!(flows.len(), 1);
+        let flow = &flows[0];
+        assert_eq!(flow.name, "Reservation lifecycle");
+        assert!(flow.business_summary.contains("pending"));
+        assert!(flow.developer_summary.contains("behavior paths"));
+        assert!(flow.steps.iter().any(|step| {
+            step.statement
+                .contains("sets Reservation.status to `confirmed`")
+        }));
+        assert!(flow.candidate_rules.iter().any(|rule| {
+            rule.statement
+                .contains("Reservation may become `confirmed`")
+        }));
+
+        let markdown = render_django_domain_flow_markdown(flow);
+        assert!(markdown.contains("## Business Summary"));
+        assert!(markdown.contains("## Candidate Rules"));
     }
 
     fn minimal_pack(
