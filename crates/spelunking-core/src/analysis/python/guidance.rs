@@ -4,13 +4,13 @@ use super::subject::{
     inspect_django_subject, normalize_token,
 };
 use crate::{graph::relative_path_identifier, parsing::ParsedPythonModule};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashSet},
     path::Path,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoGuidanceReport {
     pub subject: String,
     pub analysis_basis: DjangoGuidanceBasis,
@@ -23,7 +23,7 @@ pub struct DjangoGuidanceReport {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoGuidanceBasis {
     pub scope: String,
     pub data_sources: Vec<String>,
@@ -31,7 +31,7 @@ pub struct DjangoGuidanceBasis {
     pub caveats: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoGuidanceSubjectSlice {
     pub model_found: bool,
     pub lifecycle_candidate_found: bool,
@@ -42,7 +42,7 @@ pub struct DjangoGuidanceSubjectSlice {
     pub evidence_items: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoRiskSignal {
     pub title: String,
     pub severity: String,
@@ -51,7 +51,7 @@ pub struct DjangoRiskSignal {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoOpenQuestion {
     pub question: String,
     pub reason: String,
@@ -59,7 +59,7 @@ pub struct DjangoOpenQuestion {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoReadingPathEntry {
     pub priority: usize,
     pub path: String,
@@ -69,7 +69,7 @@ pub struct DjangoReadingPathEntry {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoRelatedTest {
     pub path: String,
     pub line: usize,
@@ -78,7 +78,7 @@ pub struct DjangoRelatedTest {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoCouplingSignal {
     pub kind: String,
     pub description: String,

@@ -7,7 +7,7 @@ use super::subject::{
     inspect_django_subject,
 };
 use crate::parsing::ParsedPythonModule;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -39,7 +39,7 @@ pub const DJANGO_DOMAIN_FACT_BASES: &[&str] = &["observed", "inferred", "confirm
 /// Review statuses for facts. Increment 1 extraction emits only proposed facts.
 pub const DJANGO_DOMAIN_FACT_STATUSES: &[&str] = &["proposed", "confirmed", "rejected", "stale"];
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoEvidencePack {
     pub schema_version: u32,
     pub subject: String,
@@ -57,7 +57,7 @@ pub struct DjangoEvidencePack {
     pub confidence: DjangoEvidenceConfidence,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoEvidenceLifecycle {
     pub model: Option<DjangoSubjectModel>,
     pub field: Option<String>,
@@ -66,7 +66,7 @@ pub struct DjangoEvidenceLifecycle {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoEvidenceRelationshipMap {
     pub related_models: Vec<DjangoRelatedModel>,
     pub related_components: Vec<DjangoRelatedComponent>,
@@ -74,7 +74,7 @@ pub struct DjangoEvidenceRelationshipMap {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoEvidenceConfidence {
     pub subject: String,
     pub behavior: String,
@@ -87,7 +87,7 @@ pub struct DjangoEvidenceConfidence {
 /// `subject` remains a backward-compatible alias for `technical_subject`. `pack_id`
 /// indexes the evidence pack in merged JSONL output, while `primary_concept` and
 /// `field_concept` are candidate business concepts that must remain reviewable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoDomainFact {
     pub schema_version: u32,
     pub id: String,
@@ -105,6 +105,7 @@ pub struct DjangoDomainFact {
     pub origin: String,
     pub basis: String,
     pub status: String,
+    pub requires_human_review: bool,
     pub rationale: String,
 }
 
@@ -282,6 +283,22 @@ fn extract_django_domain_facts_for_pack(pack: &DjangoEvidencePack) -> Vec<Django
                 "inferred",
                 "A write to a lifecycle state suggests a candidate domain transition, but valid transition rules need human review.",
             );
+
+            if let Some(statement) =
+                external_participation_statement(pack, &model_name, &state, site)
+            {
+                push_domain_fact(
+                    &mut facts,
+                    &context,
+                    "flow_step",
+                    statement,
+                    mutation_evidence.clone(),
+                    site.confidence.clone(),
+                    "heuristic",
+                    "inferred",
+                    "A cross-area mutation writes a detected lifecycle state, suggesting a business capability outside the owning model participates in this transition.",
+                );
+            }
         } else {
             push_domain_fact(
                 &mut facts,
@@ -331,15 +348,10 @@ fn extract_django_domain_facts_for_pack(pack: &DjangoEvidencePack) -> Vec<Django
     }
 
     for risk in &pack.risk_signals {
-        let fact_type = if risk.title.contains("Out-of-request") {
-            "side_effect"
-        } else {
-            "boundary_risk"
-        };
         push_domain_fact(
             &mut facts,
             &context,
-            fact_type,
+            risk_fact_type(pack, risk),
             risk.description.clone(),
             risk.evidence.clone(),
             risk.confidence.clone(),
@@ -893,6 +905,7 @@ fn push_domain_fact(
         origin: origin.to_owned(),
         basis: basis.to_owned(),
         status: "proposed".to_owned(),
+        requires_human_review: true,
         rationale: rationale.to_owned(),
     });
 }
@@ -1138,6 +1151,139 @@ fn mutation_channel(site: &DjangoMutationSite) -> String {
     }
 }
 
+fn external_participation_statement(
+    pack: &DjangoEvidencePack,
+    model_name: &str,
+    state: &str,
+    site: &DjangoMutationSite,
+) -> Option<String> {
+    let model_app = pack
+        .lifecycle
+        .model
+        .as_ref()
+        .map(|model| app_area_from_path(&model.path))?;
+    let site_app = app_area_from_path(&site.path);
+
+    if site_app == "unknown" || site_app == model_app {
+        return None;
+    }
+
+    let actor = business_concept_from_area_or_name(&site_app, &site.container_name);
+    let event = state_event_name(state);
+
+    Some(format!(
+        "{actor} {event} appears to participate in {model_name} {event}."
+    ))
+}
+
+fn risk_fact_type(pack: &DjangoEvidencePack, risk: &DjangoRiskSignal) -> &'static str {
+    if risk.evidence.iter().any(|evidence| {
+        pack.mutation_sites.iter().any(|site| {
+            site.path == evidence.path
+                && site.line == evidence.line
+                && mutation_kind_has_side_effect_surface(&site.container_kind)
+        })
+    }) {
+        "side_effect"
+    } else {
+        "boundary_risk"
+    }
+}
+
+fn mutation_kind_has_side_effect_surface(kind: &str) -> bool {
+    matches!(
+        kind,
+        "task" | "signal_handler" | "webhook" | "management_command" | "async_function"
+    )
+}
+
+fn app_area_from_path(path: &str) -> String {
+    let parts = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+
+    if let Some((index, _)) = parts.iter().enumerate().find(|(_, part)| **part == "apps")
+        && let Some(app) = parts.get(index + 1)
+    {
+        return (*app).to_owned();
+    }
+
+    for marker in [
+        "models",
+        "views",
+        "serializers",
+        "forms",
+        "tasks",
+        "signals",
+        "admin",
+        "webhooks",
+        "management",
+        "tests",
+    ] {
+        if let Some(index) = parts
+            .iter()
+            .position(|part| part.trim_end_matches(".py") == marker)
+            && index > 0
+        {
+            return parts[index - 1].to_owned();
+        }
+    }
+
+    parts.first().copied().unwrap_or("unknown").to_owned()
+}
+
+fn business_concept_from_area_or_name(area: &str, name: &str) -> String {
+    let normalized_name = name.to_ascii_lowercase();
+
+    for token in [
+        "payment",
+        "reservation",
+        "booking",
+        "purchase",
+        "ticket",
+        "order",
+    ] {
+        if normalized_name.contains(token) {
+            return title_case_domain_token(token);
+        }
+    }
+
+    title_case_domain_token(area.trim_end_matches('s'))
+}
+
+fn title_case_domain_token(value: &str) -> String {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            match characters.next() {
+                Some(first) => {
+                    let mut token = first.to_uppercase().collect::<String>();
+                    token.push_str(&characters.as_str().to_ascii_lowercase());
+                    token
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn state_event_name(state: &str) -> String {
+    match domain_token(state).as_str() {
+        "confirmed" | "confirm" => "confirmation".to_owned(),
+        "cancelled" | "canceled" | "cancel" => "cancellation".to_owned(),
+        "expired" | "expire" => "expiration".to_owned(),
+        "reserved" | "reserve" => "reservation".to_owned(),
+        "locked" | "lock" => "locking".to_owned(),
+        "unlocked" | "unlock" => "unlocking".to_owned(),
+        normalized if !normalized.is_empty() => format!("`{state}` transition"),
+        _ => "lifecycle transition".to_owned(),
+    }
+}
+
 fn transition_statement(model_name: &str, state: &str, site: &DjangoMutationSite) -> String {
     match site.container_kind.as_str() {
         "model_method" => {
@@ -1268,6 +1414,14 @@ mod tests {
                 && fact.id.starts_with("payment-status-fact-")
                 && fact.statement.contains("Payment.status")
         }));
+        assert!(facts.iter().all(|fact| fact.requires_human_review));
+        assert!(facts.iter().any(|fact| {
+            fact.fact_type == "flow_step"
+                && fact.statement.contains(
+                    "Payment confirmation appears to participate in Reservation confirmation",
+                )
+                && fact.basis == "inferred"
+        }));
     }
 
     #[test]
@@ -1336,6 +1490,34 @@ mod tests {
                 "flow_step" | "business_rule_candidate"
             ) && fact.statement.contains("`active`")
                 && !fact.statement.contains("`inactive`")
+        }));
+    }
+
+    #[test]
+    fn deserializes_generated_evidence_pack_json_for_fact_extraction() {
+        let pack = minimal_pack(
+            "Reservation.status",
+            "Reservation",
+            "status",
+            &["confirmed"],
+            vec![mutation_site(
+                "webhook",
+                "payments/webhooks.py",
+                12,
+                "payment_webhook",
+                Some("Reservation.CONFIRMED"),
+            )],
+        );
+        let json = serde_json::to_string(&pack).expect("pack should serialize");
+        let parsed: DjangoEvidencePack =
+            serde_json::from_str(&json).expect("pack should deserialize");
+
+        let facts = extract_django_domain_facts(&parsed);
+
+        assert!(facts.iter().any(|fact| {
+            fact.pack_id == "reservation-status"
+                && fact.primary_concept.as_deref() == Some("Reservation")
+                && fact.field_concept.as_deref() == Some("status")
         }));
     }
 

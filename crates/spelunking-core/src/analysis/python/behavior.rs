@@ -9,13 +9,13 @@ use super::subject::{
 };
 use crate::{graph::relative_path_identifier, parsing::ParsedPythonModule};
 use rustpython_parser::ast::{self, Expr, Stmt, StmtAsyncFunctionDef, StmtFunctionDef};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashSet},
     path::Path,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoBehaviorReport {
     pub subject: String,
     pub model: Option<DjangoSubjectModel>,
@@ -25,7 +25,7 @@ pub struct DjangoBehaviorReport {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoMutationSite {
     pub kind: String,
     pub container_kind: String,
@@ -38,14 +38,14 @@ pub struct DjangoMutationSite {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoBehaviorPath {
     pub kind: String,
     pub steps: Vec<DjangoBehaviorStep>,
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoBehaviorStep {
     pub kind: String,
     pub name: String,

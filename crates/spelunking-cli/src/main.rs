@@ -1,12 +1,12 @@
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use spelunking_core::{
-    DjangoArtifactBundle, DjangoBehaviorReport, DjangoDomainFact, DjangoGuidanceReport,
-    DjangoSubjectReport, Edge, EdgeType, GraphExport, GraphFilter, Node, NodeType,
-    PythonParseDiagnostic, PythonParseReport, analyze_python_project, build_django_artifact_bundle,
-    build_django_evidence_pack, discover_python_files, django_subject_slug,
-    extract_django_domain_facts_from_packs, inspect_django_behavior, inspect_django_guidance,
-    inspect_django_subject, parse_python_files, relative_path_identifier,
+    DjangoArtifactBundle, DjangoBehaviorReport, DjangoDomainFact, DjangoEvidencePack,
+    DjangoGuidanceReport, DjangoSubjectReport, Edge, EdgeType, GraphExport, GraphFilter, Node,
+    NodeType, PythonParseDiagnostic, PythonParseReport, analyze_python_project,
+    build_django_artifact_bundle, build_django_evidence_pack, discover_python_files,
+    django_subject_slug, extract_django_domain_facts_from_packs, inspect_django_behavior,
+    inspect_django_guidance, inspect_django_subject, parse_python_files, relative_path_identifier,
     render_django_domain_facts_jsonl,
 };
 use std::{
@@ -56,6 +56,10 @@ struct Cli {
     #[arg(long = "inspect-domain-facts", value_name = "MODEL.FIELD", value_delimiter = ',', num_args = 1..)]
     inspect_domain_facts: Vec<String>,
 
+    /// Extract candidate domain facts from already generated evidence-pack JSON files.
+    #[arg(long = "inspect-domain-facts-from-pack", value_name = "PATH", value_delimiter = ',', num_args = 1..)]
+    inspect_domain_facts_from_packs: Vec<PathBuf>,
+
     /// Generate the JSON evidence pack for a Django model field under the artifact directory.
     #[arg(long = "generate-evidence-pack", value_name = "MODEL.FIELD")]
     generate_evidence_pack: Option<String>,
@@ -63,6 +67,10 @@ struct Cli {
     /// Generate JSONL candidate domain facts for a Django model field under the artifact directory.
     #[arg(long = "generate-domain-facts", value_name = "MODEL.FIELD", value_delimiter = ',', num_args = 1..)]
     generate_domain_facts: Vec<String>,
+
+    /// Generate JSONL candidate domain facts from already generated evidence-pack JSON files.
+    #[arg(long = "generate-domain-facts-from-pack", value_name = "PATH", value_delimiter = ',', num_args = 1..)]
+    generate_domain_facts_from_packs: Vec<PathBuf>,
 
     /// Generate the Markdown lifecycle report for a Django model field under the artifact directory.
     #[arg(long = "generate-report", value_name = "MODEL.FIELD")]
@@ -128,8 +136,10 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         cli.inspect_behavior.is_some(),
         cli.inspect_guidance.is_some(),
         !cli.inspect_domain_facts.is_empty(),
+        !cli.inspect_domain_facts_from_packs.is_empty(),
         cli.generate_evidence_pack.is_some(),
         !cli.generate_domain_facts.is_empty(),
+        !cli.generate_domain_facts_from_packs.is_empty(),
         cli.generate_report.is_some(),
         cli.generate_evaluation.is_some(),
         cli.generate_artifacts.is_some(),
@@ -146,9 +156,40 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         .into());
     }
 
+    let mut output = output_writer(cli.output.as_deref())?;
+
+    if !cli.inspect_domain_facts_from_packs.is_empty() {
+        let facts =
+            build_domain_facts_from_evidence_pack_paths(&cli.inspect_domain_facts_from_packs)?;
+
+        match cli.format {
+            OutputFormat::Summary => write_domain_facts_summary(&mut output, &facts)?,
+            OutputFormat::Json => write_domain_facts_json(&mut output, &facts)?,
+            OutputFormat::Dot => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--inspect-domain-facts-from-pack supports --format summary or --format json",
+                )
+                .into());
+            }
+        }
+
+        output.flush()?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if !cli.generate_domain_facts_from_packs.is_empty() {
+        ensure_artifact_summary_format(cli.format, "--generate-domain-facts-from-pack")?;
+        let facts =
+            build_domain_facts_from_evidence_pack_paths(&cli.generate_domain_facts_from_packs)?;
+        let generated = write_domain_facts_artifact(&cli, &facts)?;
+        write_generated_artifacts_summary(&mut output, &generated)?;
+        output.flush()?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let python_files = discover_python_files(&cli.target)?;
     let parse_report = parse_python_files(&python_files);
-    let mut output = output_writer(cli.output.as_deref())?;
 
     if let Some(subject) = &cli.generate_artifacts {
         ensure_artifact_summary_format(cli.format, "--generate-artifacts")?;
@@ -386,6 +427,26 @@ fn build_domain_facts_for_subjects(
     }
 
     Ok(extract_django_domain_facts_from_packs(&packs))
+}
+
+fn build_domain_facts_from_evidence_pack_paths(
+    paths: &[PathBuf],
+) -> Result<Vec<DjangoDomainFact>, Box<dyn std::error::Error>> {
+    let mut packs = Vec::new();
+
+    for path in paths {
+        packs.push(read_evidence_pack(path)?);
+    }
+
+    Ok(extract_django_domain_facts_from_packs(&packs))
+}
+
+fn read_evidence_pack(path: &Path) -> Result<DjangoEvidencePack, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = io::BufReader::new(file);
+    let pack = serde_json::from_reader(reader)?;
+
+    Ok(pack)
 }
 
 fn write_domain_facts_artifact(
@@ -781,6 +842,11 @@ fn write_domain_facts_summary(
         if let Some(field_concept) = &fact.field_concept {
             writeln!(output, "  Field concept: {field_concept}")?;
         }
+        writeln!(
+            output,
+            "  Requires human review: {}",
+            yes_no(fact.requires_human_review)
+        )?;
         writeln!(output, "  Origin: {}", fact.origin)?;
         writeln!(output, "  Rationale: {}", fact.rationale)?;
 

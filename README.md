@@ -59,7 +59,13 @@ Pass multiple subjects as repeated values or comma-separated values to produce o
 cargo run -p spelunking-cli -- /path/to/django-project --inspect-domain-facts reservations.Reservation.status,payments.Payment.status
 ```
 
-Domain facts use schema version `1`. Each JSONL line includes `id`, `pack_id`, `statement`, `type`, `subject`, `technical_subject`, `primary_concept`, `field_concept`, `evidence`, `confidence`, `origin`, `basis`, `status`, and `rationale`. Valid `type` values are `domain_concept_candidate`, `lifecycle_candidate`, `business_rule_candidate`, `flow_step`, `concept_relationship`, `boundary_risk`, `side_effect`, `open_question`, `pending_decision`, and `glossary_term_candidate`. Increment 1 emits `origin` values `programmatic` or `heuristic`, `basis` values `observed` or `inferred`, and `status` value `proposed`; later review work may introduce `llm`, `human`, `confirmed`, `rejected`, and `stale`.
+Already generated evidence-pack JSON files can be used without re-running project analysis:
+
+```sh
+cargo run -p spelunking-cli -- /path/to/django-project --inspect-domain-facts-from-pack .domain-atlas/evidence-packs/reservations-reservation-status.json
+```
+
+Domain facts use schema version `1`. Each JSONL line includes `id`, `pack_id`, `statement`, `type`, `subject`, `technical_subject`, `primary_concept`, `field_concept`, `evidence`, `confidence`, `origin`, `basis`, `status`, `requires_human_review`, and `rationale`. Valid `type` values are `domain_concept_candidate`, `lifecycle_candidate`, `business_rule_candidate`, `flow_step`, `concept_relationship`, `boundary_risk`, `side_effect`, `open_question`, `pending_decision`, and `glossary_term_candidate`. Increment 1 emits `origin` values `programmatic` or `heuristic`, `basis` values `observed` or `inferred`, `status` value `proposed`, and `requires_human_review=true`; later review work may introduce `llm`, `human`, `confirmed`, `rejected`, and `stale`.
 
 Generate consumable artifacts for humans and agents. By default these are written under `.domain-atlas` in the inspected project:
 
@@ -74,7 +80,7 @@ This writes:
 - `.domain-atlas/reports/reservations-reservation-status-lifecycle.md`: short human lifecycle report
 - `.domain-atlas/evaluation/reservations-reservation-status-evaluation.md`: scorecard for comparing manual exploration, a generic agent, and an agent using the evidence pack
 
-Generate a single artifact with `--generate-evidence-pack`, `--generate-domain-facts`, `--generate-report`, or `--generate-evaluation`. Use `--artifact-dir` to write somewhere else.
+Generate a single artifact with `--generate-evidence-pack`, `--generate-domain-facts`, `--generate-domain-facts-from-pack`, `--generate-report`, or `--generate-evaluation`. Use `--artifact-dir` to write somewhere else.
 
 The CLI can also emit the current graph contract as versioned JSON. The export includes summary counts, filters, parse/read diagnostics, and the graph itself. The graph contains source-file, Django app, model, URL, view, serializer, form, service, middleware, context processor, signal, signal handler, and task nodes, plus containment, call, inheritance, direct ORM relationship, URL routing, serialization, query, global hook intercept, and trigger edges:
 

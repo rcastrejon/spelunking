@@ -3,7 +3,7 @@ use crate::{graph::relative_path_identifier, parsing::ParsedPythonModule};
 use rustpython_parser::ast::{
     self, Constant, Expr, Ranged, Stmt, StmtAsyncFunctionDef, StmtClassDef, StmtFunctionDef,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     error::Error,
@@ -11,7 +11,7 @@ use std::{
     path::Path,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoSubjectReport {
     pub subject: String,
     pub model: Option<DjangoSubjectModel>,
@@ -24,7 +24,7 @@ pub struct DjangoSubjectReport {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoSubjectModel {
     pub name: String,
     pub qualified_name: String,
@@ -35,7 +35,7 @@ pub struct DjangoSubjectModel {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoLifecycleCandidate {
     pub field: String,
     pub field_type: String,
@@ -45,7 +45,7 @@ pub struct DjangoLifecycleCandidate {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoSubjectState {
     pub value: String,
     pub path: String,
@@ -54,7 +54,7 @@ pub struct DjangoSubjectState {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoSubjectField {
     pub name: String,
     pub field_type: String,
@@ -65,7 +65,7 @@ pub struct DjangoSubjectField {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoRelatedModel {
     pub model: String,
     pub field: String,
@@ -76,7 +76,7 @@ pub struct DjangoRelatedModel {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoRelevantMethod {
     pub name: String,
     pub path: String,
@@ -86,7 +86,7 @@ pub struct DjangoRelevantMethod {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DjangoRelatedComponent {
     pub kind: String,
     pub name: String,
@@ -97,7 +97,7 @@ pub struct DjangoRelatedComponent {
     pub confidence: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DjangoSubjectEvidence {
     pub path: String,
     pub line: usize,
