@@ -11,6 +11,7 @@ use serde::Serialize;
 use std::path::Path;
 
 pub const DJANGO_EVIDENCE_PACK_SCHEMA_VERSION: u32 = 1;
+pub const DJANGO_DOMAIN_FACT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DjangoEvidencePack {
@@ -55,9 +56,26 @@ pub struct DjangoEvidenceConfidence {
     pub overall: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DjangoDomainFact {
+    pub schema_version: u32,
+    pub id: String,
+    pub statement: String,
+    #[serde(rename = "type")]
+    pub fact_type: String,
+    pub subject: String,
+    pub evidence: Vec<DjangoSubjectEvidence>,
+    pub confidence: String,
+    pub origin: String,
+    pub basis: String,
+    pub status: String,
+    pub rationale: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DjangoArtifactBundle {
     pub evidence_pack: DjangoEvidencePack,
+    pub domain_facts: Vec<DjangoDomainFact>,
     pub markdown_report: String,
     pub evaluation_report: String,
 }
@@ -85,14 +103,257 @@ pub fn build_django_artifact_bundle(
     subject: &str,
 ) -> Result<DjangoArtifactBundle, DjangoSubjectError> {
     let evidence_pack = build_django_evidence_pack(root, modules, subject)?;
+    let domain_facts = extract_django_domain_facts(&evidence_pack);
     let markdown_report = render_django_markdown_report(&evidence_pack);
     let evaluation_report = render_django_evaluation_report(&evidence_pack);
 
     Ok(DjangoArtifactBundle {
         evidence_pack,
+        domain_facts,
         markdown_report,
         evaluation_report,
     })
+}
+
+pub fn extract_django_domain_facts(pack: &DjangoEvidencePack) -> Vec<DjangoDomainFact> {
+    let model_name = domain_model_name(pack);
+    let field_name = domain_field_name(pack);
+    let subject = pack.subject.clone();
+    let mut facts = Vec::new();
+
+    push_domain_fact(
+        &mut facts,
+        "domain_concept_candidate",
+        subject.clone(),
+        format!("{model_name} appears to be a domain concept in this behavior slice."),
+        model_evidence(pack),
+        pack.lifecycle.confidence.clone(),
+        "programmatic",
+        "observed",
+        "The evidence pack found a Django model as the primary subject of the inspected behavior.",
+    );
+
+    if pack.lifecycle.field.is_some() {
+        push_domain_fact(
+            &mut facts,
+            "lifecycle_candidate",
+            subject.clone(),
+            format!("{model_name} appears to have a lifecycle controlled by `{field_name}`."),
+            lifecycle_evidence(pack),
+            pack.lifecycle.confidence.clone(),
+            "heuristic",
+            "inferred",
+            "A subject field with detected states or mutations is being treated as candidate lifecycle evidence.",
+        );
+    }
+
+    if !pack.lifecycle.states.is_empty() {
+        push_domain_fact(
+            &mut facts,
+            "lifecycle_candidate",
+            subject.clone(),
+            format!(
+                "{model_name}.{field_name} exposes observed lifecycle states: {}.",
+                state_values(&pack.lifecycle.states)
+            ),
+            state_evidence(pack),
+            pack.lifecycle.confidence.clone(),
+            "programmatic",
+            "observed",
+            "Lifecycle states were detected from model constants, choices, or nearby field evidence.",
+        );
+    }
+
+    for relationship in &pack.relationship_map.related_models {
+        push_domain_fact(
+            &mut facts,
+            "concept_relationship",
+            subject.clone(),
+            format!(
+                "{model_name} is related to {} through `{}` ({}).",
+                relationship.model, relationship.field, relationship.relationship
+            ),
+            vec![DjangoSubjectEvidence {
+                path: relationship.path.clone(),
+                line: relationship.line,
+                detail: format!("relationship field {}", relationship.field),
+            }],
+            relationship.confidence.clone(),
+            "programmatic",
+            "observed",
+            "A Django ORM relationship was detected on or near the subject model.",
+        );
+    }
+
+    for site in &pack.mutation_sites {
+        let mutation_evidence = vec![DjangoSubjectEvidence {
+            path: site.path.clone(),
+            line: site.line,
+            detail: format!("{} mutation in {}", site.kind, site.container_name),
+        }];
+        let channel = mutation_channel(site);
+
+        if let Some(state) = state_value_from_mutation(site, &pack.lifecycle.states) {
+            push_domain_fact(
+                &mut facts,
+                "flow_step",
+                subject.clone(),
+                format!("{model_name}.{field_name} is set to `{state}` through {channel}."),
+                mutation_evidence.clone(),
+                site.confidence.clone(),
+                "programmatic",
+                "observed",
+                "A mutation site writes a detected lifecycle state to the subject field.",
+            );
+            push_domain_fact(
+                &mut facts,
+                "business_rule_candidate",
+                subject.clone(),
+                transition_statement(&model_name, &state, site),
+                mutation_evidence.clone(),
+                site.confidence.clone(),
+                "heuristic",
+                "inferred",
+                "A write to a lifecycle state suggests a candidate domain transition, but valid transition rules need human review.",
+            );
+        } else {
+            push_domain_fact(
+                &mut facts,
+                "flow_step",
+                subject.clone(),
+                format!("{model_name}.{field_name} is mutated through {channel}."),
+                mutation_evidence.clone(),
+                site.confidence.clone(),
+                "programmatic",
+                "observed",
+                "A mutation site writes to the subject field, even though no concrete lifecycle state was extracted.",
+            );
+        }
+
+        if matches!(
+            site.container_kind.as_str(),
+            "task" | "signal_handler" | "webhook" | "management_command"
+        ) {
+            push_domain_fact(
+                &mut facts,
+                "side_effect",
+                subject.clone(),
+                format!(
+                    "{model_name}.{field_name} can change outside the normal request path through {channel}."
+                ),
+                mutation_evidence,
+                site.confidence.clone(),
+                "heuristic",
+                "inferred",
+                "The mutation occurs in async, signal, webhook, or command code, so side effects and idempotency may need review.",
+            );
+        }
+    }
+
+    for signal in &pack.coupling_signals {
+        push_domain_fact(
+            &mut facts,
+            "boundary_risk",
+            subject.clone(),
+            signal.description.clone(),
+            signal.evidence.clone(),
+            signal.confidence.clone(),
+            "heuristic",
+            "inferred",
+            "A coupling signal indicates that the behavior may cross ownership or layer boundaries.",
+        );
+    }
+
+    for risk in &pack.risk_signals {
+        let fact_type = if risk.title.contains("Out-of-request") {
+            "side_effect"
+        } else {
+            "boundary_risk"
+        };
+        push_domain_fact(
+            &mut facts,
+            fact_type,
+            subject.clone(),
+            risk.description.clone(),
+            risk.evidence.clone(),
+            risk.confidence.clone(),
+            "heuristic",
+            "inferred",
+            &format!("Guidance raised this risk signal: {}.", risk.title),
+        );
+    }
+
+    for question in &pack.open_questions {
+        push_domain_fact(
+            &mut facts,
+            "open_question",
+            subject.clone(),
+            question.question.clone(),
+            question.evidence.clone(),
+            question.confidence.clone(),
+            "heuristic",
+            "inferred",
+            &question.reason,
+        );
+
+        if let Some(statement) = pending_decision_statement(&model_name, &field_name, question) {
+            push_domain_fact(
+                &mut facts,
+                "pending_decision",
+                subject.clone(),
+                statement,
+                question.evidence.clone(),
+                question.confidence.clone(),
+                "heuristic",
+                "inferred",
+                "The open question implies a domain ownership or transition decision that should be reviewed by the team.",
+            );
+        }
+    }
+
+    push_domain_fact(
+        &mut facts,
+        "glossary_term_candidate",
+        subject.clone(),
+        format!("`{model_name}` is a candidate glossary term for this behavior slice."),
+        model_evidence(pack),
+        pack.lifecycle.confidence.clone(),
+        "heuristic",
+        "inferred",
+        "The model name appears as the central noun in the evidence pack and should be validated against business language.",
+    );
+
+    if !pack.lifecycle.states.is_empty() {
+        push_domain_fact(
+            &mut facts,
+            "glossary_term_candidate",
+            subject,
+            format!(
+                "{} are candidate lifecycle vocabulary terms for {model_name}.{field_name}.",
+                state_values(&pack.lifecycle.states)
+            ),
+            state_evidence(pack),
+            pack.lifecycle.confidence.clone(),
+            "heuristic",
+            "inferred",
+            "Detected states may represent ubiquitous language, but the business terms need confirmation.",
+        );
+    }
+
+    finalize_domain_facts(&pack.subject, facts)
+}
+
+pub fn render_django_domain_facts_jsonl(
+    facts: &[DjangoDomainFact],
+) -> Result<String, serde_json::Error> {
+    let mut output = String::new();
+
+    for fact in facts {
+        output.push_str(&serde_json::to_string(fact)?);
+        output.push('\n');
+    }
+
+    Ok(output)
 }
 
 pub fn render_django_markdown_report(pack: &DjangoEvidencePack) -> String {
@@ -533,6 +794,205 @@ fn risk_summary(pack: &DjangoEvidencePack) -> String {
             .map(|risk| risk.title.clone())
             .collect::<Vec<_>>()
             .join(", ")
+    }
+}
+
+fn push_domain_fact(
+    facts: &mut Vec<DjangoDomainFact>,
+    fact_type: &str,
+    subject: String,
+    statement: String,
+    evidence: Vec<DjangoSubjectEvidence>,
+    confidence: String,
+    origin: &str,
+    basis: &str,
+    rationale: &str,
+) {
+    if evidence.is_empty() {
+        return;
+    }
+
+    facts.push(DjangoDomainFact {
+        schema_version: DJANGO_DOMAIN_FACT_SCHEMA_VERSION,
+        id: String::new(),
+        statement,
+        fact_type: fact_type.to_owned(),
+        subject,
+        evidence,
+        confidence,
+        origin: origin.to_owned(),
+        basis: basis.to_owned(),
+        status: "proposed".to_owned(),
+        rationale: rationale.to_owned(),
+    });
+}
+
+fn finalize_domain_facts(subject: &str, mut facts: Vec<DjangoDomainFact>) -> Vec<DjangoDomainFact> {
+    facts.sort_by(|left, right| {
+        left.fact_type
+            .cmp(&right.fact_type)
+            .then(left.statement.cmp(&right.statement))
+    });
+    facts.dedup_by(|left, right| {
+        left.fact_type == right.fact_type && left.statement == right.statement
+    });
+
+    let slug = django_subject_slug(subject);
+    for (index, fact) in facts.iter_mut().enumerate() {
+        fact.id = format!("{slug}-fact-{:03}", index + 1);
+    }
+
+    facts
+}
+
+fn domain_model_name(pack: &DjangoEvidencePack) -> String {
+    pack.lifecycle
+        .model
+        .as_ref()
+        .map(|model| model.name.clone())
+        .unwrap_or_else(|| {
+            pack.subject
+                .split('.')
+                .rev()
+                .nth(1)
+                .unwrap_or(&pack.subject)
+                .to_owned()
+        })
+}
+
+fn domain_field_name(pack: &DjangoEvidencePack) -> String {
+    pack.lifecycle.field.clone().unwrap_or_else(|| {
+        pack.subject
+            .rsplit('.')
+            .next()
+            .unwrap_or("field")
+            .to_owned()
+    })
+}
+
+fn model_evidence(pack: &DjangoEvidencePack) -> Vec<DjangoSubjectEvidence> {
+    pack.lifecycle
+        .model
+        .as_ref()
+        .map(|model| {
+            vec![DjangoSubjectEvidence {
+                path: model.path.clone(),
+                line: model.line,
+                detail: format!("primary model {}", model.name),
+            }]
+        })
+        .unwrap_or_default()
+}
+
+fn lifecycle_evidence(pack: &DjangoEvidencePack) -> Vec<DjangoSubjectEvidence> {
+    let mut evidence = model_evidence(pack);
+    evidence.extend(state_evidence(pack).into_iter().take(4));
+    evidence
+}
+
+fn state_evidence(pack: &DjangoEvidencePack) -> Vec<DjangoSubjectEvidence> {
+    pack.lifecycle
+        .states
+        .iter()
+        .map(|state| DjangoSubjectEvidence {
+            path: state.path.clone(),
+            line: state.line,
+            detail: format!("detected lifecycle state {}", state.value),
+        })
+        .collect()
+}
+
+fn state_value_from_mutation(
+    site: &DjangoMutationSite,
+    states: &[DjangoSubjectState],
+) -> Option<String> {
+    let value = site.value.as_deref().unwrap_or(&site.mutation);
+    let normalized_value = domain_token(value);
+
+    states
+        .iter()
+        .find(|state| {
+            let normalized_state = domain_token(&state.value);
+            !normalized_state.is_empty() && normalized_value.contains(&normalized_state)
+        })
+        .map(|state| state.value.clone())
+}
+
+fn domain_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn mutation_channel(site: &DjangoMutationSite) -> String {
+    match site.container_kind.as_str() {
+        "model_method" => format!("model method `{}`", site.container_name),
+        "view" => format!("API view `{}`", site.container_name),
+        "serializer" => format!("serializer `{}`", site.container_name),
+        "form" => format!("form `{}`", site.container_name),
+        "task" => format!("background task `{}`", site.container_name),
+        "signal_handler" => format!("Django signal handler `{}`", site.container_name),
+        "webhook" => format!("webhook `{}`", site.container_name),
+        "admin_action" => format!("admin action `{}`", site.container_name),
+        "management_command" => format!("management command `{}`", site.container_name),
+        _ => format!("{} `{}`", site.container_kind, site.container_name),
+    }
+}
+
+fn transition_statement(model_name: &str, state: &str, site: &DjangoMutationSite) -> String {
+    match site.container_kind.as_str() {
+        "model_method" => {
+            format!("{model_name} has a model-level transition toward `{state}`.")
+        }
+        "view" => format!("{model_name} may become `{state}` through an API action."),
+        "serializer" | "form" => format!(
+            "{model_name} may become `{state}` during validation or request data processing."
+        ),
+        "task" => {
+            format!("{model_name} may become `{state}` from background processing.")
+        }
+        "signal_handler" => {
+            format!("{model_name} may become `{state}` from implicit Django signal behavior.")
+        }
+        "webhook" => {
+            format!("{model_name} may become `{state}` from external webhook behavior.")
+        }
+        "admin_action" => {
+            format!("{model_name} may be set to `{state}` manually through admin behavior.")
+        }
+        "management_command" => {
+            format!("{model_name} may be set to `{state}` through a management command.")
+        }
+        _ => format!(
+            "{model_name} may become `{state}` through {}.",
+            mutation_channel(site)
+        ),
+    }
+}
+
+fn pending_decision_statement(
+    model_name: &str,
+    field_name: &str,
+    question: &DjangoOpenQuestion,
+) -> Option<String> {
+    let normalized = question.question.to_ascii_lowercase();
+
+    if normalized.contains("which module should own") {
+        Some(format!(
+            "Decide which module owns valid transitions for {model_name}.{field_name}."
+        ))
+    } else if normalized.contains("should this external app transition") {
+        Some(format!(
+            "Decide whether external apps may transition {model_name}.{field_name} directly."
+        ))
+    } else if normalized.contains("admin changes") || normalized.contains("admin cancellation") {
+        Some(format!(
+            "Decide whether admin changes to {model_name}.{field_name} must follow the same rules as API changes."
+        ))
+    } else {
+        None
     }
 }
 

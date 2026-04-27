@@ -105,9 +105,10 @@ pub struct DjangoSubjectEvidence {
 }
 
 pub use super::artifacts::{
-    DJANGO_EVIDENCE_PACK_SCHEMA_VERSION, DjangoArtifactBundle, DjangoEvidenceConfidence,
-    DjangoEvidenceLifecycle, DjangoEvidencePack, DjangoEvidenceRelationshipMap,
-    build_django_artifact_bundle, build_django_evidence_pack, django_subject_slug,
+    DJANGO_DOMAIN_FACT_SCHEMA_VERSION, DJANGO_EVIDENCE_PACK_SCHEMA_VERSION, DjangoArtifactBundle,
+    DjangoDomainFact, DjangoEvidenceConfidence, DjangoEvidenceLifecycle, DjangoEvidencePack,
+    DjangoEvidenceRelationshipMap, build_django_artifact_bundle, build_django_evidence_pack,
+    django_subject_slug, extract_django_domain_facts, render_django_domain_facts_jsonl,
     render_django_evaluation_report, render_django_markdown_report,
 };
 pub use super::behavior::{
@@ -2521,6 +2522,26 @@ def test_payment_confirms_reservation(db):
                 .evaluation_report
                 .contains("## Comparison Scorecard")
         );
+        assert!(artifacts.domain_facts.iter().any(|fact| {
+            fact.fact_type == "lifecycle_candidate"
+                && fact.statement.contains("lifecycle controlled by `status`")
+                && fact.basis == "inferred"
+                && fact.status == "proposed"
+        }));
+        assert!(artifacts.domain_facts.iter().any(|fact| {
+            fact.fact_type == "boundary_risk"
+                && fact.statement.contains("mutated from")
+                && !fact.evidence.is_empty()
+        }));
+        assert!(artifacts.domain_facts.iter().any(|fact| {
+            fact.fact_type == "open_question"
+                && fact
+                    .statement
+                    .contains("Which module should own valid transitions")
+        }));
+        let facts_jsonl = render_django_domain_facts_jsonl(&artifacts.domain_facts)
+            .expect("domain facts JSONL should render");
+        assert!(facts_jsonl.contains(r#""type":"lifecycle_candidate""#));
         assert_eq!(
             django_subject_slug("reservations.Reservation.status"),
             "reservations-reservation-status"

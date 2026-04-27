@@ -1,11 +1,12 @@
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use spelunking_core::{
-    DjangoArtifactBundle, DjangoBehaviorReport, DjangoGuidanceReport, DjangoSubjectReport, Edge,
-    EdgeType, GraphExport, GraphFilter, Node, NodeType, PythonParseDiagnostic, PythonParseReport,
-    analyze_python_project, build_django_artifact_bundle, discover_python_files,
-    django_subject_slug, inspect_django_behavior, inspect_django_guidance, inspect_django_subject,
-    parse_python_files, relative_path_identifier,
+    DjangoArtifactBundle, DjangoBehaviorReport, DjangoDomainFact, DjangoGuidanceReport,
+    DjangoSubjectReport, Edge, EdgeType, GraphExport, GraphFilter, Node, NodeType,
+    PythonParseDiagnostic, PythonParseReport, analyze_python_project, build_django_artifact_bundle,
+    discover_python_files, django_subject_slug, inspect_django_behavior, inspect_django_guidance,
+    inspect_django_subject, parse_python_files, relative_path_identifier,
+    render_django_domain_facts_jsonl,
 };
 use std::{
     collections::HashSet,
@@ -50,9 +51,17 @@ struct Cli {
     #[arg(long = "inspect-guidance", value_name = "MODEL.FIELD")]
     inspect_guidance: Option<String>,
 
+    /// Extract candidate domain facts for a Django model field.
+    #[arg(long = "inspect-domain-facts", value_name = "MODEL.FIELD")]
+    inspect_domain_facts: Option<String>,
+
     /// Generate the JSON evidence pack for a Django model field under the artifact directory.
     #[arg(long = "generate-evidence-pack", value_name = "MODEL.FIELD")]
     generate_evidence_pack: Option<String>,
+
+    /// Generate JSONL candidate domain facts for a Django model field under the artifact directory.
+    #[arg(long = "generate-domain-facts", value_name = "MODEL.FIELD")]
+    generate_domain_facts: Option<String>,
 
     /// Generate the Markdown lifecycle report for a Django model field under the artifact directory.
     #[arg(long = "generate-report", value_name = "MODEL.FIELD")]
@@ -117,7 +126,9 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         cli.inspect_subject.is_some(),
         cli.inspect_behavior.is_some(),
         cli.inspect_guidance.is_some(),
+        cli.inspect_domain_facts.is_some(),
         cli.generate_evidence_pack.is_some(),
+        cli.generate_domain_facts.is_some(),
         cli.generate_report.is_some(),
         cli.generate_evaluation.is_some(),
         cli.generate_artifacts.is_some(),
@@ -129,7 +140,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     if inspect_modes > 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--inspect-subject, --inspect-behavior, --inspect-guidance, and artifact generation flags cannot be used together",
+            "--inspect-subject, --inspect-behavior, --inspect-guidance, --inspect-domain-facts, and artifact generation flags cannot be used together",
         )
         .into());
     }
@@ -148,6 +159,12 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         let bundle = build_django_artifact_bundle(&cli.target, &parse_report.modules, subject)?;
         let generated =
             write_django_artifacts(&cli, subject, &bundle, ArtifactSelection::EvidencePack)?;
+        write_generated_artifacts_summary(&mut output, &generated)?;
+    } else if let Some(subject) = &cli.generate_domain_facts {
+        ensure_artifact_summary_format(cli.format, "--generate-domain-facts")?;
+        let bundle = build_django_artifact_bundle(&cli.target, &parse_report.modules, subject)?;
+        let generated =
+            write_django_artifacts(&cli, subject, &bundle, ArtifactSelection::DomainFacts)?;
         write_generated_artifacts_summary(&mut output, &generated)?;
     } else if let Some(subject) = &cli.generate_report {
         ensure_artifact_summary_format(cli.format, "--generate-report")?;
@@ -170,6 +187,20 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "--inspect-guidance supports --format summary or --format json",
+                )
+                .into());
+            }
+        }
+    } else if let Some(subject) = &cli.inspect_domain_facts {
+        let bundle = build_django_artifact_bundle(&cli.target, &parse_report.modules, subject)?;
+
+        match cli.format {
+            OutputFormat::Summary => write_domain_facts_summary(&mut output, &bundle.domain_facts)?,
+            OutputFormat::Json => write_domain_facts_json(&mut output, &bundle.domain_facts)?,
+            OutputFormat::Dot => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--inspect-domain-facts supports --format summary or --format json",
                 )
                 .into());
             }
@@ -245,6 +276,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArtifactSelection {
     EvidencePack,
+    DomainFacts,
     Report,
     Evaluation,
     All,
@@ -289,6 +321,21 @@ fn write_django_artifacts(
         write_json_file(&path, &bundle.evidence_pack)?;
         generated.push(GeneratedArtifact {
             label: "Evidence pack",
+            path,
+        });
+    }
+
+    if matches!(
+        selection,
+        ArtifactSelection::DomainFacts | ArtifactSelection::All
+    ) {
+        let path = base_dir
+            .join("facts")
+            .join(format!("{slug}-domain-facts.jsonl"));
+        let contents = render_django_domain_facts_jsonl(&bundle.domain_facts)?;
+        write_text_file(&path, &contents)?;
+        generated.push(GeneratedArtifact {
+            label: "Domain facts",
             path,
         });
     }
@@ -668,6 +715,52 @@ fn write_guidance_json(
     report: &DjangoGuidanceReport,
 ) -> Result<(), serde_json::Error> {
     serde_json::to_writer_pretty(&mut *output, report)?;
+    writeln!(output).map_err(serde_json::Error::io)
+}
+
+fn write_domain_facts_summary(
+    output: &mut dyn Write,
+    facts: &[DjangoDomainFact],
+) -> io::Result<()> {
+    if facts.is_empty() {
+        writeln!(output, "Domain facts proposed: none")?;
+        return Ok(());
+    }
+
+    writeln!(output, "Domain facts proposed: {}", facts.len())?;
+
+    for fact in facts {
+        writeln!(output)?;
+        writeln!(
+            output,
+            "- {} ({}, {}, {}, {})",
+            fact.statement, fact.fact_type, fact.basis, fact.status, fact.confidence
+        )?;
+        writeln!(output, "  Subject: {}", fact.subject)?;
+        writeln!(output, "  Origin: {}", fact.origin)?;
+        writeln!(output, "  Rationale: {}", fact.rationale)?;
+
+        for evidence in fact.evidence.iter().take(3) {
+            writeln!(
+                output,
+                "  Evidence: {}:{} {}",
+                evidence.path, evidence.line, evidence.detail
+            )?;
+        }
+
+        if fact.evidence.len() > 3 {
+            writeln!(output, "  Evidence: ... {} more", fact.evidence.len() - 3)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_domain_facts_json(
+    output: &mut dyn Write,
+    facts: &[DjangoDomainFact],
+) -> Result<(), serde_json::Error> {
+    serde_json::to_writer_pretty(&mut *output, facts)?;
     writeln!(output).map_err(serde_json::Error::io)
 }
 

@@ -47,6 +47,12 @@ cargo run -p spelunking-cli -- /path/to/django-project --inspect-guidance reserv
 
 Guidance is generated from the subject-focused behavioral slice produced by `--inspect-subject` and `--inspect-behavior`; it is not yet a literal `GraphExport` subgraph filtered to the subject. The risk and coupling signals are intentionally heuristic, so the output includes an analysis-basis section with data sources, slice counts, and caveats.
 
+Extract candidate domain facts from the evidence pack for the subject. Domain facts translate technical evidence into proposed, reviewable domain knowledge with evidence, confidence, origin, basis, and review status:
+
+```sh
+cargo run -p spelunking-cli -- /path/to/django-project --inspect-domain-facts reservations.Reservation.status
+```
+
 Generate consumable artifacts for humans and agents. By default these are written under `.domain-atlas` in the inspected project:
 
 ```sh
@@ -56,10 +62,11 @@ cargo run -p spelunking-cli -- /path/to/django-project --generate-artifacts rese
 This writes:
 
 - `.domain-atlas/evidence-packs/reservations-reservation-status.json`: compact JSON evidence pack for agents/LLMs
+- `.domain-atlas/facts/reservations-reservation-status-domain-facts.jsonl`: candidate domain facts extracted from the evidence pack
 - `.domain-atlas/reports/reservations-reservation-status-lifecycle.md`: short human lifecycle report
 - `.domain-atlas/evaluation/reservations-reservation-status-evaluation.md`: scorecard for comparing manual exploration, a generic agent, and an agent using the evidence pack
 
-Generate a single artifact with `--generate-evidence-pack`, `--generate-report`, or `--generate-evaluation`. Use `--artifact-dir` to write somewhere else.
+Generate a single artifact with `--generate-evidence-pack`, `--generate-domain-facts`, `--generate-report`, or `--generate-evaluation`. Use `--artifact-dir` to write somewhere else.
 
 The CLI can also emit the current graph contract as versioned JSON. The export includes summary counts, filters, parse/read diagnostics, and the graph itself. The graph contains source-file, Django app, model, URL, view, serializer, form, service, middleware, context processor, signal, signal handler, and task nodes, plus containment, call, inheritance, direct ORM relationship, URL routing, serialization, query, global hook intercept, and trigger edges:
 
